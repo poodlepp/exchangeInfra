@@ -1,0 +1,12 @@
+-- Flyway initial migration placeholder.
+-- Add table DDL for the exchange domain (users, orders, wallets, ...) below.
+-- Each subsequent migration must follow the naming convention: V<version>__<description>.sql
+--
+-- Example:
+--   V2__create_users_table.sql
+--   V3__create_orders_table.sql
+--
+-- Keeping this file empty (besides this comment) is intentional so that the
+-- baseline migration succeeds out of the box. Replace with real DDL once the
+-- schema is designed.
+SELECT 1;
