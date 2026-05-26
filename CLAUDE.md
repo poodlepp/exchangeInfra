@@ -27,6 +27,15 @@
 - **不引入工作流引擎**：状态机用 Spring Statemachine 表达 + Kafka 事件驱动主推进 + ShedLock 兜底巡检。不上 Camunda / Activiti。
 - **模块组织**：`wallet` 与 `common` 内部用 **Java 子包**做强分层，**不拆 Maven 子模块**——避免侵入现有所有依赖方的 pom。
 
+## 执行节奏
+
+按 `docs/superpowers/plans/<当前阶段>.md` 逐 Task 推进时：
+
+- **一个 Task 一个 commit**：每完成一个 Task（所有 step 通过），立即 `git commit`。commit message 用 plan 中该 Task 的 `git commit -m` 模板（一般在最后一个 step）。
+- **不批量 commit**：不允许多个 Task 攒一起再提交，否则 review 与回滚粒度都会丢失。
+- **测试不绿不准 commit**：如果该 Task 包含测试 step，测试必须先全绿。
+- **commit 前 `git status` 自检**：避免遗漏新建文件 / 误带入无关改动。
+
 ## 知识沉淀
 
 项目中遇到的技术要点、面试题、踩坑总结，统一沉淀到 `question/` 目录，按主题分类整理为 Markdown 文档：
