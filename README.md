@@ -63,6 +63,16 @@ java -jar bootstrap/target/exchange-bootstrap-1.0.0-SNAPSHOT.jar
 
 可通过环境变量覆盖默认连接配置:`MYSQL_URL`、`MYSQL_USER`、`MYSQL_PASSWORD`、`REDIS_HOST`、`REDIS_PORT`、`REDIS_PASSWORD`。
 
+## 本地基础设施
+
+`infra/` 目录提供基于 Docker Compose 的本地 MySQL / Redis / Kafka(KRaft 模式)一键编排。一键启动:
+
+```bash
+cd infra && cp .env.example .env && docker compose up -d
+```
+
+详细说明、可选管理工具与排错见 [infra/README.md](./infra/README.md)。
+
 ## 目录结构
 
 ```
