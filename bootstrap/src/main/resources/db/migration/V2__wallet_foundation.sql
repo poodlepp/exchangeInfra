@@ -157,3 +157,81 @@ CREATE TABLE chain_tx (
   KEY idx_to_addr (chain, to_address),
   KEY idx_chain_height (chain, block_height)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- ========== 业务流程 ==========
+CREATE TABLE deposit_order (
+  id            BIGINT PRIMARY KEY,
+  user_id       BIGINT NOT NULL,
+  coin_id       BIGINT NOT NULL,
+  chain_tx_id   BIGINT NOT NULL,
+  amount        DECIMAL(38,18) NOT NULL,
+  status        VARCHAR(32) NOT NULL,
+  confirm_count INT NOT NULL DEFAULT 0,
+  version       INT NOT NULL DEFAULT 0,
+  created_at    DATETIME(3) NOT NULL,
+  updated_at    DATETIME(3) NOT NULL,
+  UNIQUE KEY uk_chain_tx (chain_tx_id),
+  KEY idx_user_status (user_id, status)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE withdraw_order (
+  id              BIGINT PRIMARY KEY,
+  user_id         BIGINT NOT NULL,
+  coin_id         BIGINT NOT NULL,
+  chain           VARCHAR(16) NOT NULL,
+  to_address      VARCHAR(128) NOT NULL,
+  amount          DECIMAL(38,18) NOT NULL,
+  fee             DECIMAL(38,18) NOT NULL DEFAULT 0,
+  fee_estimate    DECIMAL(38,18),
+  status          VARCHAR(32) NOT NULL,
+  fail_reason     VARCHAR(255),
+  risk_decision   VARCHAR(32),
+  signed_raw      MEDIUMTEXT,
+  tx_hash         VARCHAR(128),
+  nonce           BIGINT,
+  from_address    VARCHAR(128),
+  replace_of_id   BIGINT,
+  confirm_count   INT NOT NULL DEFAULT 0,
+  version         INT NOT NULL DEFAULT 0,
+  created_at      DATETIME(3) NOT NULL,
+  updated_at      DATETIME(3) NOT NULL,
+  KEY idx_status_time (status, created_at),
+  KEY idx_user (user_id, status),
+  KEY idx_chain_from_nonce (chain, from_address, nonce),
+  UNIQUE KEY uk_tx_hash (tx_hash)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE sweep_order (
+  id            BIGINT PRIMARY KEY,
+  chain         VARCHAR(16) NOT NULL,
+  coin_id       BIGINT NOT NULL,
+  src_address   VARCHAR(128) NOT NULL,
+  dst_address   VARCHAR(128) NOT NULL,
+  amount        DECIMAL(38,18) NOT NULL,
+  status        VARCHAR(32) NOT NULL,
+  drip_tx_hash  VARCHAR(128),
+  sweep_tx_hash VARCHAR(128),
+  nonce         BIGINT,
+  retry_count   INT NOT NULL DEFAULT 0,
+  version       INT NOT NULL DEFAULT 0,
+  created_at    DATETIME(3) NOT NULL,
+  updated_at    DATETIME(3) NOT NULL,
+  KEY idx_chain_status (chain, status),
+  UNIQUE KEY uk_sweep_tx (sweep_tx_hash)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE treasury_movement (
+  id            BIGINT PRIMARY KEY,
+  chain         VARCHAR(16) NOT NULL,
+  coin_id       BIGINT NOT NULL,
+  direction     VARCHAR(16) NOT NULL,
+  amount        DECIMAL(38,18) NOT NULL,
+  status        VARCHAR(32) NOT NULL,
+  psbt          MEDIUMTEXT,
+  tx_hash       VARCHAR(128),
+  proposer      VARCHAR(64),
+  approver_list VARCHAR(512),
+  created_at    DATETIME(3) NOT NULL,
+  updated_at    DATETIME(3) NOT NULL,
+  KEY idx_status (status)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
