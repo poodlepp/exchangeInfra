@@ -68,3 +68,39 @@ CREATE TABLE chain_config (
   updated_at        DATETIME(3) NOT NULL,
   UNIQUE KEY uk_chain (chain)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- ========== 地址与密钥 ==========
+CREATE TABLE wallet_address (
+  id          BIGINT PRIMARY KEY,
+  user_id     BIGINT NOT NULL,
+  chain       VARCHAR(16) NOT NULL,
+  address     VARCHAR(128) NOT NULL,
+  hd_path     VARCHAR(64) NOT NULL,
+  key_id      VARCHAR(64) NOT NULL,
+  status      TINYINT NOT NULL DEFAULT 1,
+  created_at  DATETIME(3) NOT NULL,
+  updated_at  DATETIME(3) NOT NULL,
+  UNIQUE KEY uk_chain_addr (chain, address),
+  KEY idx_user_chain (user_id, chain),
+  KEY idx_key_id (key_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE hd_path (
+  id        BIGINT PRIMARY KEY,
+  chain     VARCHAR(16) NOT NULL,
+  hd_path   VARCHAR(64) NOT NULL,
+  used_at   DATETIME(3) NOT NULL,
+  UNIQUE KEY uk_chain_path (chain, hd_path)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE key_material (
+  id              BIGINT PRIMARY KEY,
+  key_id          VARCHAR(64) NOT NULL,
+  key_type        VARCHAR(16) NOT NULL,
+  cipher_text     MEDIUMBLOB NOT NULL,
+  iv              VARBINARY(32) NOT NULL,
+  kms_alias       VARCHAR(128) NOT NULL,
+  algo_version    INT NOT NULL DEFAULT 1,
+  created_at      DATETIME(3) NOT NULL,
+  UNIQUE KEY uk_key_id (key_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
