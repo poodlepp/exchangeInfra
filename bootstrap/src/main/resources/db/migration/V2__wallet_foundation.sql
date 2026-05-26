@@ -235,3 +235,53 @@ CREATE TABLE treasury_movement (
   updated_at    DATETIME(3) NOT NULL,
   KEY idx_status (status)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- ========== 归集与水位辅助 ==========
+CREATE TABLE nonce_register (
+  chain          VARCHAR(16) NOT NULL,
+  address        VARCHAR(128) NOT NULL,
+  next_nonce     BIGINT NOT NULL,
+  on_chain_nonce BIGINT NOT NULL,
+  reconciled_at  DATETIME(3) NOT NULL,
+  version        INT NOT NULL DEFAULT 0,
+  PRIMARY KEY (chain, address)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE address_balance (
+  chain         VARCHAR(16) NOT NULL,
+  address       VARCHAR(128) NOT NULL,
+  coin_id       BIGINT NOT NULL,
+  balance       DECIMAL(38,18) NOT NULL,
+  block_height  BIGINT NOT NULL,
+  refreshed_at  DATETIME(3) NOT NULL,
+  PRIMARY KEY (chain, address, coin_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE treasury_policy (
+  id                BIGINT PRIMARY KEY,
+  chain             VARCHAR(16) NOT NULL,
+  coin_id           BIGINT NOT NULL,
+  hot_low_ratio     DECIMAL(5,4) NOT NULL,
+  hot_high_ratio    DECIMAL(5,4) NOT NULL,
+  hot_target_ratio  DECIMAL(5,4) NOT NULL,
+  total_target      DECIMAL(38,18) NOT NULL,
+  daily_outflow_avg DECIMAL(38,18),
+  created_at        DATETIME(3) NOT NULL,
+  updated_at        DATETIME(3) NOT NULL,
+  UNIQUE KEY uk_chain_coin (chain, coin_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- ========== 对账报告 ==========
+CREATE TABLE reconcile_report (
+  id            BIGINT PRIMARY KEY,
+  report_date   DATE NOT NULL,
+  chain         VARCHAR(16) NOT NULL,
+  coin_id       BIGINT NOT NULL,
+  ledger_total  DECIMAL(38,18),
+  chain_total   DECIMAL(38,18),
+  delta         DECIMAL(38,18),
+  status        VARCHAR(16) NOT NULL,
+  detail_json   MEDIUMTEXT,
+  created_at    DATETIME(3) NOT NULL,
+  UNIQUE KEY uk_date_chain_coin (report_date, chain, coin_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
