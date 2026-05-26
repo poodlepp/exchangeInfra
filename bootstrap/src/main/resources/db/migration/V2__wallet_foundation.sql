@@ -104,3 +104,56 @@ CREATE TABLE key_material (
   created_at      DATETIME(3) NOT NULL,
   UNIQUE KEY uk_key_id (key_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- ========== 账户与流水（双账法）==========
+CREATE TABLE account (
+  id          BIGINT PRIMARY KEY,
+  user_id     BIGINT NOT NULL,
+  coin_id     BIGINT NOT NULL,
+  available   DECIMAL(38,18) NOT NULL DEFAULT 0,
+  frozen      DECIMAL(38,18) NOT NULL DEFAULT 0,
+  version     INT NOT NULL DEFAULT 0,
+  created_at  DATETIME(3) NOT NULL,
+  updated_at  DATETIME(3) NOT NULL,
+  UNIQUE KEY uk_user_coin (user_id, coin_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE account_journal (
+  id            BIGINT PRIMARY KEY,
+  trace_id      VARCHAR(64) NOT NULL,
+  account_id    BIGINT NOT NULL,
+  coin_id       BIGINT NOT NULL,
+  biz_type      VARCHAR(32) NOT NULL,
+  biz_id        BIGINT NOT NULL,
+  direction     TINYINT NOT NULL,
+  amount        DECIMAL(38,18) NOT NULL,
+  balance_after DECIMAL(38,18) NOT NULL,
+  remark        VARCHAR(255),
+  created_at    DATETIME(3) NOT NULL,
+  UNIQUE KEY uk_trace_direction_account (trace_id, direction, account_id),
+  KEY idx_account_time (account_id, created_at),
+  KEY idx_biz (biz_type, biz_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- ========== 链上交易快照 ==========
+CREATE TABLE chain_tx (
+  id            BIGINT PRIMARY KEY,
+  chain         VARCHAR(16) NOT NULL,
+  tx_hash       VARCHAR(128) NOT NULL,
+  vout          INT NOT NULL DEFAULT 0,
+  block_height  BIGINT NOT NULL,
+  block_hash    VARCHAR(128) NOT NULL,
+  parent_hash   VARCHAR(128) NOT NULL,
+  from_address  VARCHAR(128),
+  to_address    VARCHAR(128) NOT NULL,
+  coin_id       BIGINT,
+  amount        DECIMAL(38,18) NOT NULL,
+  direction     TINYINT NOT NULL,
+  confirm_count INT NOT NULL DEFAULT 0,
+  status        TINYINT NOT NULL,
+  raw_json      MEDIUMTEXT,
+  created_at    DATETIME(3) NOT NULL,
+  UNIQUE KEY uk_chain_hash_vout (chain, tx_hash, vout),
+  KEY idx_to_addr (chain, to_address),
+  KEY idx_chain_height (chain, block_height)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
