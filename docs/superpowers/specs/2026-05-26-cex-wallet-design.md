@@ -16,11 +16,13 @@
 
 ### 1.2 非目标
 
-- 不实现冷钱包多签离线签名工具链（仅在接口预留）
+- 不实现冷钱包多签离线签名工具链（仅在接口预留，treasury 子包按"多签收集"语义对接）
 - 不集成 MPC/TSS 库（仅在 `Signer` 接口处预留实现位）
 - 不接入第三方 AML/KYT 服务（如 TRM / Chainalysis），但 `RiskGuard` 抽象允许后续接入
 - 不覆盖交易（撮合）侧风控
 - 不引入 Camunda / Activiti 工作流引擎（论证见 §5）
+- 不实现 ETH internal transactions 解析（仅在 `wallet.chain.eth` 留 `InternalTxScanner` 接口位）
+- 不实现 PoR（储备金证明）/ Apollo 配置中心 / OpenTelemetry tracing（在 §12 提一笔为加分项）
 
 ## 2. 总体架构
 
@@ -47,8 +49,13 @@ exchangeInfra/
 │       ├── chain/eth/                      # web3j 实现
 │       ├── chain/tron/                     # trident-java 实现
 │       ├── signer/                         # HD 派生 + AES-GCM + KmsProvider + Signer 实现
-│       ├── scanner/                        # 区块/交易扫描
+│       ├── nonce/                          # NonceAllocator: 并发安全的 nonce/UTXO 分配
+│       ├── fee/                            # FeeStrategy: 链特化手续费估算（EIP-1559 / sat/vB / TRON energy）
+│       ├── scanner/                        # 区块/交易扫描 + reorg 检测回滚
 │       ├── withdraw/                       # 提现状态机（Spring Statemachine）
+│       ├── sweep/                          # 归集状态机（用户地址 → 主热钱包）
+│       ├── treasury/                       # 冷热分层水位 + 出冷/入冷调度
+│       ├── reconcile/                      # 链上 vs 链下对账作业
 │       └── riskbridge/                     # 防腐层，对接 risk 顶层模块
 ├── risk/                                   # 现有顶层模块：钱包侧风控规则、黑名单、额度、人工复核
 ├── trade/ user/ market/ admin/ bootstrap/  # 现有
@@ -283,16 +290,19 @@ CREATE TABLE chain_tx (
   vout          INT NOT NULL DEFAULT 0,    -- BTC 输出序号；ETH/TRON 固定 0
   block_height  BIGINT NOT NULL,
   block_hash    VARCHAR(128) NOT NULL,
+  parent_hash   VARCHAR(128) NOT NULL,     -- reorg 检测用
   from_address  VARCHAR(128),
   to_address    VARCHAR(128) NOT NULL,
   coin_id       BIGINT,
   amount        DECIMAL(38,18) NOT NULL,
   direction     TINYINT NOT NULL,          -- 1=入站 0=我方提现出站
   confirm_count INT DEFAULT 0,
+  status        TINYINT NOT NULL,          -- 0=PENDING 1=CONFIRMED 2=ORPHANED(reorg失效) 3=DROPPED(链上回退)
   raw_json      MEDIUMTEXT,                -- 节点原始返回，审计/回放用
   created_at    DATETIME(3),
   UNIQUE KEY uk_chain_hash_vout (chain, tx_hash, vout),
-  KEY idx_to_addr (chain, to_address)
+  KEY idx_to_addr (chain, to_address),
+  KEY idx_chain_height (chain, block_height)
 );
 ```
 
@@ -322,18 +332,78 @@ CREATE TABLE withdraw_order (
   to_address      VARCHAR(128) NOT NULL,
   amount          DECIMAL(38,18) NOT NULL,
   fee             DECIMAL(38,18) NOT NULL,
+  fee_estimate    DECIMAL(38,18),          -- 估算 fee（建单时）；fee 字段为实际入账 fee
   status          VARCHAR(32) NOT NULL,
   fail_reason     VARCHAR(255),
   risk_decision   VARCHAR(32),             -- PASS / REJECT / MANUAL
   signed_raw      MEDIUMTEXT,              -- 签名后 rawTx hex，签后回填
   tx_hash         VARCHAR(128),            -- 广播后回填
+  nonce           BIGINT,                  -- ETH/TRON: 分配的 nonce / 序列号
+  from_address    VARCHAR(128),            -- 主热钱包出金地址（建单时锁定）
+  replace_of_id   BIGINT,                  -- 加速/取消时指向被替代的订单
   confirm_count   INT DEFAULT 0,
-  version         INT NOT NULL DEFAULT 0,  -- 乐观锁
+  version         INT NOT NULL DEFAULT 0,
   created_at      DATETIME(3),
   updated_at      DATETIME(3),
   KEY idx_status_time (status, created_at),
   KEY idx_user (user_id, status),
-  UNIQUE KEY uk_tx_hash (tx_hash)          -- 广播后唯一闸
+  KEY idx_chain_from_nonce (chain, from_address, nonce),
+  UNIQUE KEY uk_tx_hash (tx_hash)
+);
+
+CREATE TABLE sweep_order (
+  id            BIGINT PRIMARY KEY,
+  chain         VARCHAR(16) NOT NULL,
+  coin_id       BIGINT NOT NULL,
+  src_address   VARCHAR(128) NOT NULL,     -- 用户充值地址
+  dst_address   VARCHAR(128) NOT NULL,     -- 主热钱包归集地址
+  amount        DECIMAL(38,18) NOT NULL,
+  status        VARCHAR(32) NOT NULL,      -- PENDING / DRIPPING / DRIP_DONE / SIGNING / BROADCASTED / CONFIRMED / FAILED
+  drip_tx_hash  VARCHAR(128),              -- ETH/TRON 给充值地址打 gas 的 tx
+  sweep_tx_hash VARCHAR(128),              -- 归集本身的 tx
+  nonce         BIGINT,                    -- 归集 tx 的 nonce（充值地址侧）
+  retry_count   INT DEFAULT 0,
+  version       INT NOT NULL DEFAULT 0,
+  created_at    DATETIME(3),
+  updated_at    DATETIME(3),
+  KEY idx_chain_status (chain, status),
+  UNIQUE KEY uk_sweep_tx (sweep_tx_hash)
+);
+
+CREATE TABLE treasury_movement (
+  id            BIGINT PRIMARY KEY,
+  chain         VARCHAR(16) NOT NULL,
+  coin_id       BIGINT NOT NULL,
+  direction     VARCHAR(16) NOT NULL,      -- HOT_TO_COLD（入冷）/ COLD_TO_HOT（出冷）
+  amount        DECIMAL(38,18) NOT NULL,
+  status        VARCHAR(32) NOT NULL,      -- PROPOSED / SIGNED / BROADCASTED / CONFIRMED / FAILED
+  psbt          MEDIUMTEXT,                -- BTC: PSBT；ETH: Safe txHash + 多签收集状态
+  tx_hash       VARCHAR(128),
+  proposer      VARCHAR(64),               -- admin 用户名
+  approver_list VARCHAR(512),              -- 多签批准人 JSON
+  created_at    DATETIME(3),
+  updated_at    DATETIME(3),
+  KEY idx_status (status)
+);
+
+CREATE TABLE nonce_register (
+  chain         VARCHAR(16) NOT NULL,
+  address       VARCHAR(128) NOT NULL,
+  next_nonce    BIGINT NOT NULL,           -- 下一个待分配的 nonce
+  on_chain_nonce BIGINT NOT NULL,          -- 上次校准时链上 pending nonce
+  reconciled_at DATETIME(3),               -- 上次校准时间
+  version       INT NOT NULL DEFAULT 0,    -- 乐观锁
+  PRIMARY KEY (chain, address)
+);
+
+CREATE TABLE address_balance (              -- 地址级链上余额快照（归集触发器 + 对账）
+  chain         VARCHAR(16) NOT NULL,
+  address       VARCHAR(128) NOT NULL,
+  coin_id       BIGINT NOT NULL,
+  balance       DECIMAL(38,18) NOT NULL,
+  block_height  BIGINT NOT NULL,
+  refreshed_at  DATETIME(3),
+  PRIMARY KEY (chain, address, coin_id)
 );
 ```
 
@@ -448,6 +518,262 @@ public abstract class AbstractScanner {
 - 黑名单地址（本地维护 + 接口预留外部 AML 服务）
 - 大额阈值触发人工复核（`MANUAL` → `withdraw_order.status=MANUAL_REVIEW`，admin 后台审批后回写事件）
 
+### 6.7 Nonce / 序列号管理
+
+ETH/TRON 同一出金地址的并发交易必须严格按"分配号"顺序进入 mempool；BTC 没有 nonce，但 UTXO selection 也是同类问题（同一 UTXO 不能并发花两次）。统一在 `wallet.nonce.NonceAllocator` 中处理：
+
+```java
+public interface NonceAllocator {
+    long allocate(String chain, String fromAddress);   // 分配下一个 nonce
+    void release(String chain, String fromAddress, long nonce);  // 失败回收（仅当 tx 未广播）
+    void reconcile(String chain, String fromAddress);  // 与链上 pending nonce 校准
+}
+```
+
+**ETH/TRON 实现**：
+- 单进程内基于 `nonce_register` 表 `UPDATE next_nonce = next_nonce + 1 WHERE chain=? AND address=? AND version=?` 乐观锁分配
+- 多实例并发用 Redis Lua 脚本 `INCR + 校准` 兜底（脚本内同时读 DB version + Redis counter，差异超阈值告警）
+- 启动时与每 100 笔签名后 `eth_getTransactionCount(pending)` 校准 `next_nonce`
+- 失败回收只对"分配后未广播"有效；"广播后失败"必须填补（用 `replace_of_id` 发同 nonce 替换交易）
+
+**Nonce gap 处理**：
+- 卡住的 tx（gas 太低）→ 加速：同 nonce + 高 gas + 新签名，新建一笔 `withdraw_order(replace_of_id=旧id)`，旧订单进 `REPLACED` 终态
+- 取消：同 nonce + 转给自己 + 足够 gas，专用工具流程，admin 触发
+
+**BTC 实现**：
+- UTXO selection 用 branch-and-bound（bitcoinj 内置 `CoinSelector`），同一 UTXO 在 `utxo_lock`（Redis SETNX，TTL 5 分钟）锁定后才进交易
+- 双花在 mempool 层就会被节点拒绝，依赖节点检查兜底
+
+**面试覆盖点**：并发分配 / 启动校准 / 卡住交易加速取消 / 多实例一致性。
+
+### 6.8 归集流程（Sweep）
+
+用户充值落到 `wallet_address` 表的散点地址，必须归集到主热钱包才能用于出金。归集状态机由 `wallet.sweep.SweepStateMachine` 驱动：
+
+**触发条件**（`SweepTrigger` 定时扫，每 10 分钟一次）：
+- `address_balance.balance >= sweep_threshold`（按 coin 配置，例：USDT-ERC20=100、BTC=0.01）
+- 且充值地址数量超过 `batch_min_count`（避免频繁打 gas，浪费手续费）
+
+**状态机**（`sweep_order`）：
+```
+PENDING → DRIPPING（ETH/TRON 给充值地址打 gas，BTC 跳过）
+        → DRIP_DONE → SIGNING → BROADCASTED → CONFIRMED
+        → 链上确认后调 ledger.transferInternal()（系统中间账户内部划转）
+```
+
+**ETH/ERC20 归集（drip 模式）**：
+- 主热钱包先发 `eth_sendTransaction` 给充值地址打"刚好够 gas 的 ETH"（drip）
+- drip 上链后，从充值地址发 ERC20 `transfer` 到主归集地址
+- drip 金额需精算（避免给充值地址留余额，否则一直触发归集）
+
+**TRON/TRC20 归集（fee_payer 模式优先）**：
+- 主账户质押 TRX 获取 energy（不消耗 TRX）
+- 用 `fee_payer` 由主账户代付 energy/bandwidth，充值地址零余额也能转出 TRC20
+- fee_payer 不可用时降级到 drip 模式
+
+**BTC 归集**：
+- 一笔 tx 多 input：把 N 个充值地址的 UTXO 合并到主归集地址输出
+- bitcoinj 多 input PSBT，每个 input 独立用对应地址私钥签名（多次调 `Signer.sign`）
+- fee 平摊到 input 数量上，越多越便宜
+
+**与提现的资金关系**：归集 tx confirmed 后，`treasury.HotWalletBalanceService` 增加主热钱包余额（仅链上视图），账本侧由 `LedgerService.transferInternal(系统散点中间账户 → 系统主热钱包账户)` 双账法双写。
+
+**面试覆盖点**：drip / fee_payer / UTXO 合并 / gas 经济性 / 归集失败重试 / 与提现的资金衔接。
+
+### 6.9 链上对账（不同于双账法的内部对账）
+
+双账法保证账本"自洽"，链上对账保证账本与链上"一致"。`wallet.reconcile.ReconcileJob` 每天凌晨跑一次，按 coin 维度三层校验：
+
+**第一层：账本自洽**
+```sql
+SELECT coin_id, SUM(direction * amount) FROM account_journal GROUP BY coin_id;
+-- 任何一行 != 0 → 严重告警，停机调查
+```
+
+**第二层：账本余额 = journal 累加**
+```sql
+-- 对每个 account 做：account.available - SUM(journal where account_id=该行) = 0
+```
+不一致 → 余额被脏写，定位 bug。
+
+**第三层：账本 = 链上**
+```
+LinkedAddresses = wallet_address 全集 + 主热钱包地址 + 系统中间账户对应链上地址
+chainBalance = Σ chainClient.getBalance(addr, coin) for addr in LinkedAddresses
+ledgerBalance = Σ account.available + Σ account.frozen for coin
+delta = chainBalance - ledgerBalance
+```
+
+**delta 处理**：
+- `delta > 0`（链上多）：可能是未识别的充值（陌生人转账、新合约）或扫块器漏处理。补扫 `chain_tx` 找差异 → 自动入账 `unknown_inflow` 账户 → 人工核验
+- `delta < 0`（链上少）：严重告警，可能是账本脏写、密钥泄漏、扫块器误判。停机调查
+- `|delta| < epsilon`（手续费抖动等）：纳入容忍
+
+**对账结果落表**：
+```sql
+CREATE TABLE reconcile_report (
+  id            BIGINT PRIMARY KEY,
+  report_date   DATE NOT NULL,
+  chain         VARCHAR(16) NOT NULL,
+  coin_id       BIGINT NOT NULL,
+  ledger_total  DECIMAL(38,18),
+  chain_total   DECIMAL(38,18),
+  delta         DECIMAL(38,18),
+  status        VARCHAR(16),               -- OK / WARN / FATAL
+  detail_json   MEDIUMTEXT,
+  created_at    DATETIME(3),
+  UNIQUE KEY uk_date_chain_coin (report_date, chain, coin_id)
+);
+```
+
+**面试覆盖点**：双账法 vs 链上对账的语义差异 / 三层校验顺序 / delta 正负不同处置 / 跑批失败如何重入。
+
+### 6.10 手续费策略（一链一策）
+
+`wallet.fee.FeeStrategy` 接口，每条链一个实现：
+
+```java
+public interface FeeStrategy {
+    String chain();
+    FeeQuote quote(FeeQuoteRequest req);   // 返回估算 fee + 链特化参数
+}
+```
+
+**ETH（EIP-1559）**：
+- `eth_feeHistory(20, "latest", [25,50,75])` 取最近 20 块 baseFee 中位数 + 50% 分位 priorityFee
+- `maxFeePerGas = baseFee * 2 + priorityFee`（2x 头寸防 baseFee 飙升）
+- `maxPriorityFeePerGas = priorityFee`
+- gasLimit：原生币转账 21000；ERC20 转账 65000（精确值通过 `eth_estimateGas` 实测）
+- 上限保护：`maxFeePerGas` 超过 `chain_config.max_gas_price_gwei` 时拒绝出单（防极端拥堵把整笔提现烧没）
+- 用户提现的 fee 从用户应收金额内扣：`实际到账 = amount - fee`
+
+**BTC（sat/vB）**：
+- 取 `estimatesmartfee 6`（6 块内确认）作为常规档；高优档用 `estimatesmartfee 1`
+- UTXO selection：bitcoinj `BranchAndBoundCoinSelector`，最小化变更（dust 优化）
+- 估算 vsize：input 数量 × 68 + output 数量 × 31 + overhead，乘 sat/vB 得 fee
+- RBF：交易未确认 30 分钟自动 RBF 加速（fee +20%，重新签名广播）
+
+**TRON（energy + bandwidth）**：
+- TRX 转账：纯 bandwidth，每字节 1000 sun，主账户质押 TRX 获取免费 bandwidth
+- TRC20 转账：energy + bandwidth；energy 通过 `triggerconstantcontract` 估算 + 30% 余量
+- 主账户质押 TRX 获取 energy 远便宜于直接烧 TRX，定时 job 监控质押率
+- fee 计算最终落到 SUN（1 TRX = 10^6 SUN）
+
+**面试覆盖点**：EIP-1559 vs Legacy / RBF / TRON energy 经济模型 / 极端拥堵保护 / 估算误差兜底（实际 > 估算时谁兜底）。
+
+### 6.11 冷热分层资金管理
+
+`wallet.treasury` 子包统一管理热钱包水位与冷热互转：
+
+**水位策略**（按 coin 配置）：
+```sql
+CREATE TABLE treasury_policy (
+  id                BIGINT PRIMARY KEY,
+  chain             VARCHAR(16) NOT NULL,
+  coin_id           BIGINT NOT NULL,
+  hot_low_ratio     DECIMAL(5,4),          -- 0.30 触发出冷
+  hot_high_ratio    DECIMAL(5,4),          -- 0.70 触发入冷
+  hot_target_ratio  DECIMAL(5,4),          -- 0.50 互转目标比例
+  total_target      DECIMAL(38,18),        -- 总头寸目标（运营手动维护）
+  daily_outflow_avg DECIMAL(38,18),        -- 日均出金（脚本统计后回写）
+  UNIQUE KEY uk_chain_coin (chain, coin_id)
+);
+```
+
+**TreasuryMonitor**（定时 5 分钟）：
+- 计算热钱包当前比例 = `hot_balance / total_target`
+- < `hot_low_ratio` → 创建 `treasury_movement(direction=COLD_TO_HOT)`，状态 `PROPOSED`，告警通知 admin 多签
+- \> `hot_high_ratio` → 自动创建 `direction=HOT_TO_COLD`，无需多签直接走（钱往冷里送，安全）
+
+**冷钱包多签流程**（仅 COLD_TO_HOT 走）：
+- BTC：admin 后台构造 PSBT，下载到离线设备依次签名（2-of-3 或 3-of-5），合并后上传，由热钱包代理广播
+- ETH：调用预部署的 Gnosis Safe 合约，多个签名收集后调用 `execTransaction`，由其中一个签名者广播
+
+**热钱包资金占比经验**：日均出金 × 1.5-2 倍，对应 `hot_target_ratio = 0.5` 时 `total_target = 日均出金 × 3-4 倍`。
+
+**与提现的联动**：提现建单时检查 `hot_balance < amount + reserve`，触发紧急 COLD_TO_HOT 流程，提现订单进入 `WAITING_TREASURY` 状态。
+
+**面试覆盖点**：水位线设定依据 / 多签的 PSBT/Gnosis Safe 区别 / 自动入冷 vs 人工出冷 / 极端情况下提现暂停策略。
+
+### 6.12 区块重组（Reorg）真实处理
+
+`safeHeight = latest - reorgDepth` 是兜底，真实生产还要主动检测和回滚：
+
+**主动检测**：每次扫块前校验链头一致性
+```java
+ChainTx lastStored = chainTxMapper.lastTxOnHeight(chain, h - 1);
+Block currentBlock = chainClient.getBlock(h);
+if (!currentBlock.parentHash.equals(lastStored.blockHash)) {
+    handleReorg(chain, h);
+    return;
+}
+```
+
+**回滚流程**（`ReorgHandler`）：
+- 从 h 倒着往前扫，找到分叉点（`block.hash == DB.block_hash` 的最大高度 h0）
+- `(h0, h]` 区间内所有 `chain_tx` 标记 `status=ORPHANED`
+- 关联的 `deposit_order`：
+  - `status=PENDING/CONFIRMED` 但还没 CREDITED → 直接回滚到 PENDING 等待重扫
+  - `status=CREDITED`（已入账）→ 反向冲账：`ledger.reverseCredit()` 写一条反向 journal 双账，`deposit_order.status=REVERSED`，告警通知用户与运营
+- 关联的 `withdraw_order`（我方提现）：
+  - `BROADCASTED/CONFIRMED` → 回到 `BROADCASTING`，重新等链上确认（同 tx_hash 通常会被重新打包）
+- scanner cursor 回退到 h0
+
+**超深重组兜底**：超过 `reorg_depth + safe_buffer` 的极端 reorg → 停机告警人工介入（PoW 链如 BTC 极端情况下可能发生 6+ 块重组）。
+
+**面试覆盖点**：reorg 检测时机 / 已入账资金的反向冲账 / 提现是否需要重新签名 / 超深 reorg 的人工流程。
+
+### 6.13 节点高可用
+
+`wallet.chain.*` 每条链支持多 RPC endpoint：
+
+```yaml
+wallet.chain.eth:
+  enabled: true
+  endpoints:
+    - { url: "http://geth-1:8545", weight: 3, role: PRIMARY }
+    - { url: "http://geth-2:8545", weight: 2, role: SECONDARY }
+    - { url: "https://mainnet.infura.io/v3/${KEY}", weight: 1, role: BACKUP }
+  circuit-breaker:
+    failure-rate-threshold: 50
+    wait-duration-in-open-state: 60s
+    sliding-window-size: 20
+```
+
+实现：
+- `MultiRpcChainClient` 包装多个底层 `Web3j` 实例
+- resilience4j `CircuitBreaker` 单 endpoint，失败率超阈值断路 60s
+- 路由策略：权重轮询 + 健康优先，BACKUP 仅在 PRIMARY/SECONDARY 全断时启用
+- 限流：每 endpoint `RateLimiter`，防触发上游配额
+- 一致性校验：高频 read 调用（getBlockNumber）周期对比多 endpoint 返回值，差异超阈值告警（防恶意/被攻陷节点）
+
+**面试覆盖点**：单点 → 多点 / 自建 vs 公有 RPC 互为备份 / 路由策略 / 节点不一致的检测。
+
+### 6.14 特殊交易场景过滤（扫块器必处理）
+
+ETH/TRON 实际链上数据远比"转账"复杂，scanner 必须过滤：
+
+**ETH**：
+- `tx.status == 0`：失败 tx，消耗 gas 但未转账，跳过
+- ERC20 Transfer Log：通过 `eth_getLogs(topic0=0xddf252ad...)` 获取，按 `to_address` 入账
+- internal transactions（合约调用产生的转账，如 multisig wallet 转出）：需要 `debug_traceBlockByHash` 或 `trace_block`（只支持 erigon/openethereum），生产大所必处理；本系统作为面试项目可在 `chain.eth` 留 `InternalTxScanner` 接口预留位
+- 多 Transfer 同 tx：循环每条 log 各自入账，`chain_tx.vout` 用 logIndex 区分
+- self-transfer（from == to）：跳过，不当充值
+- 合约创建 tx：跳过
+
+**TRON**：
+- `Transaction.ret[0].contractRet != "SUCCESS"`：失败 tx 跳过
+- TRC20：解析 `TriggerSmartContract` 的 `data` 前 4 字节为 `0xa9059cbb`（transfer 函数签名），后续 32 字节为 to，再 32 字节为 amount
+- TRC10：另一套 ABI，本系统不支持（在配置层禁用）
+
+**BTC**：
+- coinbase tx：跳过
+- 多 vout：每个 vout 独立成行，`chain_tx.vout` = output index
+- OP_RETURN output：跳过
+- segwit / taproot 地址识别：bitcoinj 已封装，但需校验地址格式 vs 链网络
+
+**面试覆盖点**：失败交易过滤 / Transfer Log 解析 / internal tx / TRC20 ABI / coinbase 与 OP_RETURN。
+
 ## 7. 链抽象 SPI
 
 `wallet.chain.api` 子包内定义如下接口与 DTO（`RawTx` / `SignedTx` / `ChainTx` / `Block` / `TransferRequest` / `TxStatus` / `KeyRef` / `DerivedAddress`）。
@@ -538,25 +864,35 @@ public interface Signer {
 
 - MPC/TSS：替换 `Signer` 实现，业务侧零改动
 - HSM：`KmsProvider` 增加 PKCS#11 实现
-- 冷钱包多签：BTC P2WSH、ETH Gnosis Safe，预留 `MultiSigSigner` 接口
-- 第三方 AML：`RiskGuard` 内增加外部评分调用，业务侧零改动
+- 冷钱包多签：BTC P2WSH、ETH Gnosis Safe，预留 `MultiSigSigner` 接口（treasury 子包已使用）
+- 第三方 AML：`RiskGuard` 内增加外部评分调用（TRM / Chainalysis），业务侧零改动
 - 新增公链：复制 `wallet.chain.tron` 子包模板，实现 5 个 SPI 接口即可
 - 拆微服务：将 `wallet.*` 子包拆出独立 jar，common-mq 已经是事件驱动，跨进程零改动
+- ETH internal transactions：在 `wallet.chain.eth` 的 `InternalTxScanner` 接口位补实现（依赖 erigon trace API）
+- 分布式 tracing：接入 OpenTelemetry，traceId 贯穿 apply→freeze→risk→sign→broadcast→confirm→settle 全链路
+- 配置中心：风控规则 / 链开关 / 限额 / 水位策略迁移到 Apollo 或 Nacos 热配置
+- 助记词分片备份：Shamir's Secret Sharing（5-of-3）做主助记词冷备
+- 储备金证明（PoR）：Merkle Tree 公开用户余额聚合根 + 链上多签地址快照
 
 ## 13. 实施顺序（高层路径）
 
 1. 在 `common` 模块内新增 `mq` 子包，含 outbox + 幂等表 + 抽象接口 + Kafka 配置
-2. 落数据库 V2 迁移脚本（业务表 10 张 + outbox + consumed_record）
+2. 落数据库 V2 迁移脚本（业务表 16 张：coin / chain_config / wallet_address / hd_path / key_material / account / account_journal / chain_tx / deposit_order / withdraw_order / sweep_order / treasury_movement / nonce_register / address_balance / treasury_policy / reconcile_report，加 common-mq 的 outbox + consumed_record）
 3. 落 `wallet.chain.api` SPI 接口与 DTO
 4. 落 `wallet.signer`：HD 派生 + AES-GCM + 本地 KmsProvider
-5. 落 `wallet.core`：账户、双账法 LedgerService、地址池
-6. 落 `wallet.chain.eth`（最简单的 Account 模型，作为第一条链跑通）
-7. 落 `wallet.scanner`（ETH 实现）+ 充值入账端到端
-8. 落 `wallet.withdraw` 状态机 + Spring Statemachine + 提现端到端
-9. 落 `wallet.riskbridge` + `risk` 模块的钱包侧规则
-10. 复制实现 `wallet.chain.btc`（UTXO 模型）
-11. 复制实现 `wallet.chain.tron`（合约调用模型）
-12. 监控指标 + 对账脚本 + 告警
-13. 集成测试与故障注入测试
+5. 落 `wallet.nonce`：NonceAllocator（DB 乐观锁 + 启动校准）
+6. 落 `wallet.fee`：FeeStrategy 抽象 + 三链实现（先 ETH，BTC/TRON 跟随各自链落地）
+7. 落 `wallet.core`：账户、双账法 LedgerService、地址池
+8. 落 `wallet.chain.eth`（含多 RPC 高可用 + 特殊交易过滤）
+9. 落 `wallet.scanner`（ETH 实现 + reorg 检测回滚）+ 充值入账端到端
+10. 落 `wallet.withdraw` 状态机 + Spring Statemachine + nonce 集成 + 提现端到端（含加速/取消）
+11. 落 `wallet.sweep` 归集状态机（ETH drip 模式优先）
+12. 落 `wallet.treasury` 水位策略 + 入冷自动 / 出冷多签预留
+13. 落 `wallet.riskbridge` + `risk` 模块的钱包侧规则
+14. 落 `wallet.reconcile` 三层对账 + reconcile_report
+15. 复制实现 `wallet.chain.btc`（UTXO 模型 + UTXO 锁 + RBF）
+16. 复制实现 `wallet.chain.tron`（合约调用模型 + fee_payer 归集 + energy 经济模型）
+17. 监控指标 + 告警规则
+18. 集成测试（充值 + 提现 + 归集 + reorg + 对账）+ 故障注入测试
 
 详细实施步骤拆分将在 writing-plans 阶段完成。
