@@ -119,4 +119,17 @@ public class SnowflakeIdGenerator {
             return 0L;
         }
     }
+
+    /**
+     * 默认单例（基于 {@link #defaultWorkerId()} 自动派生）。供无 Spring 上下文的场景使用，
+     * 例如领域事件构造、单元测试。生产代码请用注入的 {@code SnowflakeIdGenerator} Bean。
+     */
+    private static final class Holder {
+        private static final SnowflakeIdGenerator INSTANCE =
+                new SnowflakeIdGenerator(defaultWorkerId(), 0L);
+    }
+
+    public static long nextDefaultId() {
+        return Holder.INSTANCE.nextId();
+    }
 }
