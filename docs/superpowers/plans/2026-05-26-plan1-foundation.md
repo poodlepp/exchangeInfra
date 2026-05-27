@@ -621,6 +621,76 @@ Expected: 后台进程被终止。无文件改动需要提交。
 
 ## Phase 3 — common-mq 子包（消息总线）
 
+### 全景：为什么需要 outbox + ShedLock + idempotent
+
+**问题场景**：业务变更（落账 / 改单 / 改状态）写 MySQL，然后给下游发 Kafka 通知。如果中间任何一步失败：
+
+- 业务已 commit，但 Kafka 没发 → 下游错过事件、对账不齐。
+- Kafka 已发，但业务事务回滚 → 下游凭一条不存在的事件做了反应（"幽灵事件"）。
+
+两阶段提交（XA）能解，但 MySQL + Kafka 跨堆栈 XA 几乎不可用，且性能差。**Outbox 模式**用一张本地表 `outbox` 当"准发事件"，把"业务表变更 + outbox 插入"放在同一个本地事务里。事务一 commit，"事件即将发"是必然事实；之后由独立的 Relay 进程把 outbox 的行真正搬到 Kafka，是 _at-least-once_。下游必须自己做幂等。
+
+**模块拆解**：
+
+```mermaid
+flowchart LR
+  subgraph App[应用进程内]
+    Biz[业务 Service]
+    TEP[TransactionalEventPublisher<br/>Propagation.MANDATORY]
+    Relay[OutboxRelay<br/>@Scheduled + @SchedulerLock]
+    KEP[KafkaEventPublisher<br/>即时发送，无事务保证]
+    Cons[IdempotentEventHandler<br/>下游消费者基类]
+  end
+
+  subgraph DB[(MySQL)]
+    OB[(outbox)]
+    CR[(consumed_record)]
+    SL[(shedlock)]
+  end
+
+  K[(Kafka<br/>topic + DLT)]
+
+  Biz -- 同事务 --> TEP
+  TEP -- insert PENDING --> OB
+  Relay -- pickPending --> OB
+  Relay -- send --> K
+  Relay -- markSENT/markRetry --> OB
+  Relay -.加锁.-> SL
+
+  K --> Cons
+  Cons -- exists? --> CR
+  Cons -- markConsumed --> CR
+  Cons -- 业务处理 --> Biz
+```
+
+**职责切分**：
+
+| 组件 | 解决什么 | 关键约束 |
+|---|---|---|
+| `DomainEvent` / `AbstractDomainEvent` | 事件契约：`eventId`（去重键）、`aggregateId`（partition key）、`eventType`（topic）、`occurredAt` | `eventId` 必须全局唯一且稳定；下游凭它做幂等 |
+| `TransactionalEventPublisher` | 把"发事件"降级为"在 outbox 里插一行"，与业务变更同事务 | `Propagation.MANDATORY`：必须有调用方事务，否则抛错 |
+| `OutboxRelay` + `ShedLock` | 把 PENDING 行真正发到 Kafka；多实例下只有一个在跑 | 失败指数退避；同名锁 `outbox-relay` 全局互斥 |
+| `KafkaEventPublisher` | 不需要事务保证的即时通知（监控、告警） | 不进 outbox，丢了就丢了 |
+| `IdempotentEventHandler` | 消费侧重复消息的幂等闸 | `(event_id, handler_name)` 唯一约束做去重 |
+| `consumed_record` 表 | 记录"哪个 handler 处理过哪个 event" | 复合主键，INSERT IGNORE 写入 |
+
+**关键决策**：
+
+- **outbox 不做按时间分区表**：单表撑得住（PENDING 行很快被 Relay 清掉，SENT 行可异步归档）。
+- **Relay 不用 Kafka Connect Debezium**：CDC 引入额外组件，对项目复杂度不划算；轮询表 + 200ms~1s 延迟在交易场景完全可接受。
+- **Relay 用 ShedLock 而非 Redis 分布式锁**：本来就在用 MySQL，ShedLock 把锁状态也落 MySQL，避免再引一层依赖。
+- **下游幂等用表而非 Redis**：Redis 持久化弱，落表保证"消费过就一定消费过"——尤其面对账户变更这种不可逆操作。
+- **DLQ 不在 IdempotentEventHandler 里**：交给 spring-kafka 的 `DefaultErrorHandler` 配置 DLT 路由，Handler 只做异常分类（`RetriableException` 透传 / 其他原样抛）。
+
+**易踩的坑**：
+
+- 调用 `TransactionalEventPublisher.publish` 时调用方没开事务：直接抛 `IllegalTransactionStateException`——这是设计想要的，不是 bug。
+- 多实例都跑 `@Scheduled`，没开 ShedLock：同一行被两个 Relay 同时 send，下游收到重复消息。靠下游的 idempotent 兜底，但发送量翻倍，浪费 Kafka 配额。
+- Outbox 行积压：Relay 挂了或 Kafka 不可用导致积压，必须有"PENDING 行年龄超过 N 分钟"告警。
+- 下游 handler 内部用了 `@Transactional(REQUIRES_NEW)`：`markConsumed` 不在外层事务里，业务回滚但 mark 已 commit，会丢消息。本期默认所有 handler 单事务，不嵌套。
+
+---
+
 ### Task 9: 在 common 模块加 spring-kafka / shedlock / micrometer 依赖
 
 **Files:**
@@ -793,6 +863,29 @@ git commit -m "feat(mq): DomainEvent/AbstractDomainEvent/RetriableException"
 
 ### Task 11: Outbox 实体 + Mapper + 状态枚举
 
+**设计考虑**：
+
+```mermaid
+stateDiagram-v2
+    [*] --> PENDING: TransactionalEventPublisher.publish<br/>(在业务事务里 insert)
+    PENDING --> SENT: Relay 发 Kafka 成功<br/>markStatus(SENT)
+    PENDING --> PENDING: Relay 发送失败<br/>markRetry(retry_count++, next_retry_at)
+    PENDING --> FAILED: 重试达到上限<br/>(运维介入或归档)
+    SENT --> [*]: 异步归档 / 截断
+```
+
+- **`event_id` 唯一约束**：业务侧用它做"事件已写入"的幂等键。同一业务操作重试时，第二次 insert 会被唯一约束挡掉，保证一条业务变更最多一条 outbox 行。
+- **`status` 用 TINYINT 而非 enum 字符串**：节省字段宽度；`OutboxStatus.code` 是枚举值的真理，DB 字段只存数字。
+- **`retry_count` 与 `next_retry_at` 拆开**：`retry_count` 决定退避级别（指数计算），`next_retry_at` 决定何时再可被 `pickPending` 选中。`pickPending` 的 `WHERE` 条件 `(next_retry_at IS NULL OR next_retry_at <= now)` 让首次未重试的行（NULL）和到期重试的行都能被选中。
+- **`partition_key` 单独存**：Kafka 消息发送时需要 partition key 做有序保证（同 aggregate 的事件按时间序到同一分区）。从 payload JSON 里临时反序列化代价高，存字段直接拿。
+- **`payload` 用 MEDIUMTEXT**：足够装下大部分 EventEnvelope JSON；如果未来出现超大事件（很少见），考虑外部对象存储 + 引用。
+- **索引 `idx_status_next (status, next_retry_at)`**：`pickPending` 的核心查询走它；按 `status` 等值 + `next_retry_at` 范围扫，比单列 `status` 索引能多过滤一轮。
+- **不放 `eventType` 字段**：Relay 不关心 type，只关心 topic。`eventType → topic` 的映射在 Publisher 端就已经做完。
+
+**上下游契约**：
+- 上游：`TransactionalEventPublisherImpl.insert` 写入 PENDING 行，必须在调用方事务内。
+- 下游：`OutboxRelay.relay` 通过 `pickPending` 选行 → `kafkaTemplate.send` → `markStatus(SENT)` 或 `markRetry`。
+
 **Files:**
 - Create: `common/src/main/java/com/exchange/common/mq/outbox/OutboxStatus.java`
 - Create: `common/src/main/java/com/exchange/common/mq/outbox/OutboxEntity.java`
@@ -897,6 +990,30 @@ git commit -m "feat(mq): outbox entity/mapper/status enum"
 
 ### Task 12: ConsumedRecord 实体 + Mapper + Store
 
+**设计考虑**：
+
+```mermaid
+flowchart TB
+    K[Kafka 消息] --> H[IdempotentEventHandler.onMessage]
+    H --> E{exists<br/>event_id + handler_name?}
+    E -- 有 --> Skip[跳过，幂等命中]
+    E -- 无 --> Handle[handle 业务逻辑]
+    Handle -- 成功 --> Mark[markConsumed<br/>INSERT IGNORE]
+    Handle -- RetriableException --> Throw[原样抛，触发 Kafka 重试]
+    Mark --> Done[ack 提交 offset]
+```
+
+- **`(event_id, handler_name)` 复合主键**：同一事件被不同 handler 各处理一次，不互斥。比如一笔提现完成事件，"通知用户"和"更新风控水位"是两个 handler，都得各自跑一次。
+- **没有自增 id**：复合主键就是天然唯一键，省一列。
+- **`INSERT IGNORE` 而非 `ON DUPLICATE KEY UPDATE`**：第一次写入即定型，二次进来直接被唯一约束拒绝，零开销。`exists` 是先查后插的双保险——快速路径走查询，仅在 race 下才依赖 INSERT IGNORE。
+- **不用 Redis 做去重**：Redis 持久化弱，掉一次数据就可能让账户事件被重复处理。MySQL 的持久性 + 双账法本身的幂等闸（`uk(trace_id, direction, account_id)`）才是真正可靠的兜底——本表只是"避免业务逻辑被重复执行"的快门。
+- **不带 TTL**：consumed_record 不会无限增长——每个 event_id 雪花 ID 趋势递增，按 created_at 老化即可。本期不做归档，未来可加分区表 + 定时 drop 旧分区。
+
+**与 outbox 的对称性**：
+- 写侧（生产者）：业务事务 + outbox 表 + Relay = at-least-once 投递。
+- 读侧（消费者）：Kafka offset + consumed_record 表 + IdempotentHandler = 业务逻辑 exactly-once 执行。
+- 这一对配合起来才能在 Kafka 默认 at-least-once 语义之上做出"幂等等价 exactly-once"。
+
 **Files:**
 - Create: `common/src/main/java/com/exchange/common/mq/consumed/ConsumedRecordEntity.java`
 - Create: `common/src/main/java/com/exchange/common/mq/consumed/ConsumedRecordMapper.java`
@@ -989,6 +1106,26 @@ git commit -m "feat(mq): consumed_record entity/mapper/store"
 ```
 
 ### Task 13: Kafka 配置 + EventEnvelope + KafkaEventPublisher（即时发送）
+
+**设计考虑**：
+
+```mermaid
+flowchart LR
+    Caller[业务代码<br/>不需要事务保证] --> KEP[KafkaEventPublisher]
+    KEP -- wrap --> Env[EventEnvelope<br/>schemaVersion + 业务字段]
+    Env -- toJson --> Ser[EventSerializer<br/>Jackson]
+    Ser -- send(topic, key, value) --> KT[KafkaTemplate]
+    KT -- idempotence + acks=all --> K[(Kafka)]
+```
+
+- **`KafkaEventPublisher` 是"无事务保证"的即时发送通道**：用于不需要持久化保证的场景（监控、Slack 通知、日志投递）。账户、订单类的关键事件**必须走 `TransactionalEventPublisher` + outbox**，不要直接调它。
+- **Producer 三件套配置**：
+  - `enable.idempotence=true`：单 Producer 实例内防重发，避免网络重试导致 Kafka 端出现重复消息。
+  - `acks=all`：所有 in-sync replica 写入才算成功，配合 broker 端 `min.insync.replicas≥2` 才能在单节点宕机下不丢消息。
+  - `max.in.flight.requests.per.connection=5`：开 idempotence 后必须 ≤5（Kafka 限制），同时保证同一分区内有序——开 idempotence 时 broker 用 sequence number 重排，应用层无需担心乱序。
+- **`EventEnvelope` 加 `schemaVersion`**：事件结构演进的逃生通道。早期 v1 字段不变；v2 加新字段时下游能根据 schemaVersion 判断走老逻辑还是新逻辑，避免直接改字段引发反序列化失败。
+- **partition key 用 `aggregateId`**：同一聚合（同一账户、同一订单）的事件必到同一分区 → 分区内有序 = 该聚合的事件全局有序。这是后续做"按 aggregate 串行消费"的前置条件。
+- **`@ConditionalOnProperty(exchange.mq.enabled, matchIfMissing=true)`**：默认开启，但单测和某些不需要 Kafka 的部署场景可以 `exchange.mq.enabled=false` 整段绕开。`matchIfMissing` 确保不显式配置时也走默认开启。
 
 **Files:**
 - Create: `common/src/main/java/com/exchange/common/mq/kafka/EventEnvelope.java`
@@ -1144,6 +1281,44 @@ git commit -m "feat(mq): EventEnvelope/KafkaConfig/EventPublisher/KafkaEventPubl
 
 ### Task 14: TransactionalEventPublisher 接口与实现（写 outbox）
 
+**设计考虑**：
+
+```mermaid
+sequenceDiagram
+    participant Biz as Business Service
+    participant TM as TransactionManager
+    participant TEP as TxnEventPublisher
+    participant DB as MySQL
+    participant Relay as OutboxRelay (异步)
+    participant K as Kafka
+
+    Biz->>TM: @Transactional 开事务
+    Biz->>DB: UPDATE account ...
+    Biz->>TEP: publish(event)
+    Note over TEP: Propagation.MANDATORY<br/>必须有外层事务
+    TEP->>DB: INSERT outbox PENDING
+    Biz->>TM: commit
+    Note over DB: 业务变更 + outbox<br/>原子提交
+
+    Note over Relay: 独立线程
+    Relay->>DB: pickPending
+    Relay->>K: send
+    Relay->>DB: markStatus(SENT)
+```
+
+- **为什么是 `Propagation.MANDATORY` 而不是 `REQUIRED` / `REQUIRES_NEW`**：
+  - `REQUIRED`（默认）：没有事务就新开一个。Publisher 单独开事务 → outbox 行 commit 后业务事务回滚 → 出现"业务没成但事件已送达"的幻象。**严重 bug**。
+  - `REQUIRES_NEW`：强制开新事务，更糟，业务和 outbox 完全异构事务，无任何原子性保证。
+  - `MANDATORY`：必须有调用方事务，否则抛 `IllegalTransactionStateException`。在编译期 + 启动期不能保证调用者一定开事务，但运行期第一次错误调用就直接炸——把 bug 前置到调用方编写阶段，而不是潜伏到生产事故。
+- **失败场景闭环**：
+  - 业务 commit + outbox commit + Kafka 发送成功 → 正常路径。
+  - 业务 commit + outbox commit + Kafka 发送失败 → outbox 保留 PENDING，Relay 后续重试。**这是 outbox 模式的核心价值**。
+  - 业务回滚 → outbox 也回滚（同事务）→ 无脏事件。
+  - Publisher 调用时没事务 → 立刻抛错，调用方修复。
+- **不在 Publisher 内做 Kafka 发送**：发送动作完全交给 Relay。如果 Publisher 同步发，又遇到 Kafka 卡死，业务事务被拖死，反而比传统直发还糟。
+- **`event_id` 的来源**：`AbstractDomainEvent` 默认用 SnowflakeIdGenerator.nextDefaultId() 生成；如需"业务键即事件 id"（更强的去重语义，比如同一笔提现重发），子类构造时传入业务键作为 `eventId`。
+- **`outbox.id` 用 Snowflake 而非自增**：避免单点发号瓶颈、便于跨表 join 排查；趋势递增对 InnoDB 主键友好。
+
 **Files:**
 - Create: `common/src/main/java/com/exchange/common/mq/TransactionalEventPublisher.java`
 - Create: `common/src/main/java/com/exchange/common/mq/outbox/TransactionalEventPublisherImpl.java`
@@ -1263,6 +1438,51 @@ git commit -m "feat(mq): TransactionalEventPublisher writes outbox in same tx"
 ```
 
 ### Task 15: OutboxRelay（独立线程批量投递）+ ShedLock
+
+**设计考虑**：
+
+```mermaid
+flowchart TB
+    Tick["@Scheduled(fixedDelay=1000)<br/>每秒触发"]
+    Lock["@SchedulerLock<br/>name: outbox-relay"]
+    Pick[mapper.pickPending<br/>批 200 行]
+    Loop{遍历每行}
+    Send[kafkaTemplate.send.get]
+    OK[markStatus SENT]
+    Fail[markRetry<br/>retry_count + next_retry_at]
+
+    Tick --> Lock
+    Lock -- 抢到锁 --> Pick
+    Lock -- 没抢到 --> Skip[跳过本轮]
+    Pick --> Loop
+    Loop -- 成功 --> OK
+    Loop -- 失败 --> Fail
+
+    SL[(shedlock 表<br/>name=outbox-relay)]
+    Lock <-.锁状态.-> SL
+```
+
+**关键决策**：
+
+- **`fixedDelay=1000ms`**：上一轮结束到下一轮开始的间隔，不是固定频率。Relay 慢于 1 秒时会自然背压，不会堆任务。1 秒延迟在交易场景可接受；想压更低代价是 DB 轮询负载，不划算。
+- **批量 200 行**：单轮最多发 200 条。够吞吐（200 \* 1QPS = 200msg/s/instance），但又不会让锁被占太久导致其他实例长时间空转。
+- **ShedLock 的 `lockAtMostFor=30s`**：锁最多被持有 30 秒，超时强行释放。防止 Relay 进程崩溃时锁卡死。值要 ≥ 一轮处理的最大耗时（200 行 _ 单条最多 100ms = 20s），留 50% 余量。
+- **ShedLock 的 `lockAtLeastFor=500ms`**：锁至少持有 500ms，即使任务很快结束也不立刻释放。防止"分布式时钟轻微偏差导致同一行被两个实例都拿到"——A 实例 100ms 跑完释放锁，B 实例时钟稍快、立刻抢到锁 + 看到了 A 还没 commit 的更新 = 重发。500ms 是 DB 主从复制延迟的安全阈值。
+- **失败指数退避公式 `min(60 * 2^min(retry, 8), 600)`**：
+  - retry=0 → 60s
+  - retry=1 → 120s
+  - retry=3 → 480s
+  - retry≥4 → 600s（10 分钟封顶）
+  - 8 次后 retry_count 不再放大延迟。延迟封顶 600s 避免 outbox 行被无限"延后"。本期不做"超过 N 次自动转 FAILED"，靠运维监控介入。
+- **`.get()` 同步阻塞而非 `.thenAccept()`**：批内顺序处理简化错误归因。Relay 是单线程批处理，吞吐由批大小 \* 每秒次数决定，不需要并发。如果未来需要更高吞吐，开多个 Relay 实例 + ShedLock 调度，比单实例内部并发更稳。
+- **`InterruptedException` 处理**：恢复中断标志（`Thread.currentThread().interrupt()`）后直接 return，不写 markRetry——下一轮再重试。
+- **`@Scheduled` 必须配合 `@EnableScheduling`**：在 `ShedLockConfig` 上声明，避免污染其他不需要调度的 import。
+
+**易踩的坑**：
+
+- 不开 ShedLock 直接 `@Scheduled`：多副本部署时每个实例都跑，发送量被放大到副本数倍，下游 idempotent 表瞬间膨胀。
+- `lockAtMostFor` 设小了：Relay 处理一轮没跑完锁就被释放，第二个实例进来抢到锁 + 看到老数据，重发。
+- 错误处理把 `RuntimeException` 全吞了：Relay 永远不抛异常，下一轮立刻继续。这是设计选择——发送失败属于"对单条而言失败"，不应让整个 Relay 退出。但要监控 `markRetry` 的频率，超阈值告警。
 
 **Files:**
 - Create: `common/src/main/java/com/exchange/common/mq/outbox/OutboxRelay.java`
@@ -1441,6 +1661,42 @@ git commit -m "feat(mq): OutboxRelay with ShedLock + exponential backoff"
 
 ### Task 16: IdempotentEventHandler 抽象消费者
 
+**设计考虑**：
+
+```mermaid
+flowchart TB
+    M[Kafka onMessage] --> Exists{exists?}
+    Exists -- 是 --> Skip[skip<br/>不再 handle]
+    Exists -- 否 --> H[handle 业务逻辑]
+    H -- 成功返回 --> Mark[markConsumed]
+    H -- 抛 RetriableException --> Re[原样抛<br/>spring-kafka 触发重试]
+    H -- 抛其他 RuntimeException --> NR[原样抛<br/>spring-kafka 转入 DLT]
+    Mark --> Ack[ack offset]
+    Re --> Retry["DefaultErrorHandler<br/>退避 + maxAttempts"]
+    NR --> DLT["DLT topic<br/>人工介入"]
+```
+
+**关键决策**：
+
+- **"先查后处理后标记"的顺序**：
+  1. `exists?` 是快速路径，命中直接返回，不走业务逻辑。
+  2. `handle()` 跑业务（可能写多张表、调多个外部接口）。
+  3. 成功后 `markConsumed`。
+  - **顺序很重要**：如果先 mark 后 handle，handle 失败但 mark 已落 → 下次跳过 → 业务永远没执行。
+  - 如果 handle 与 mark 不同事务，且 handle 内部有副作用（例如调外部接口），可能出现"业务执行了但 mark 失败" → 下次重复执行。所以**默认要求 handle + mark 在同一个 Spring 事务**：onMessage 的调用方（Spring Kafka 的 `MessageListener` 包装）开外层 `@Transactional`，handle + markConsumed 共享。
+- **异常分类的二分法**：
+  - `RetriableException`：transient 失败（DB 死锁、外部接口超时）。原样抛 → spring-kafka 的 `DefaultErrorHandler` 按退避策略重试。**没标记 markConsumed**，重试时还会再走一次 `exists?` 检查。
+  - 其他 `RuntimeException`：non-retriable（数据格式错、业务校验失败）。原样抛 → `DefaultErrorHandler` 按 `maxAttempts` 用尽后转 DLT topic 等待人工介入。
+  - 二分法的好处：业务代码不需要写"是否要重试"的复杂判断，只需要决定异常的类型。
+- **DLQ 不在本类内**：`IdempotentEventHandler` 只做"幂等闸 + 异常类型"，**不直接发 DLT**。DLT 路由是 Spring Kafka 的基础设施配置（在 `MqAutoConfiguration` 或各业务 listener 自己的 `KafkaListenerContainerFactory` 上配 `DefaultErrorHandler` + `DeadLetterPublishingRecoverer`）。这样不同业务可以独立调整重试次数 / DLT 命名。
+- **`handlerName` 必须稳定**：作为 consumed_record 的复合键之一。重命名 = 同一事件被该 handler 重新处理一次（之前的所有 mark 失效）。建议用 `<bounded-context>.<event>.<intent>` 格式，例如 `wallet.deposit-confirmed.notify-user`。
+
+**易踩的坑**：
+
+- handle 内部 `@Transactional(REQUIRES_NEW)`：mark 不在外层事务里，handle 执行成功后外层因别的原因回滚，mark 已落 → 业务回滚但下次跳过 → 丢消息。**禁止**。
+- 把 `IllegalArgumentException`（数据格式错）当 `RetriableException` 抛：永远重试到 DLT，浪费 broker 资源。要明确分类。
+- handler 内部用 ThreadLocal 但没清理：消费 pool 复用线程，残留状态影响下一条。本基类不解决，要求子类自行处理。
+
 **Files:**
 - Create: `common/src/main/java/com/exchange/common/mq/IdempotentEventHandler.java`
 - Test: `common/src/test/java/com/exchange/common/mq/IdempotentEventHandlerTest.java`
@@ -1561,6 +1817,37 @@ git commit -m "feat(mq): IdempotentEventHandler with retriable/non-retriable spl
 
 ### Task 17: MqAutoConfiguration + 自动装配 import 文件
 
+**设计考虑**：
+
+```mermaid
+flowchart LR
+    Boot[Spring Boot 启动] --> Imp["扫 META-INF/spring/<br/>AutoConfiguration.imports"]
+    Imp --> Cond{"exchange.mq.enabled?<br/>(默认 true)"}
+    Cond -- 是 --> Mac[MqAutoConfiguration<br/>生效]
+    Cond -- 否 --> Skip[整段不装配<br/>测试 / 离线分析模式]
+    Mac --> CS["@ComponentScan<br/>com.exchange.common.mq"]
+    Mac --> MS["@MapperScan<br/>outbox + consumed"]
+    CS --> Beans[KafkaConfig / Relay / TEP / KEP / ...]
+    MS --> Mappers[OutboxMapper / ConsumedRecordMapper]
+```
+
+**关键决策**：
+
+- **为什么用 AutoConfiguration 而不是放在 bootstrap 全局扫描**：
+  - common 是被多个模块依赖的基础库。bootstrap 的 `@SpringBootApplication` 默认只扫自己的包；让它去扫 common 里的子包会污染 bootstrap 配置。
+  - AutoConfiguration 是 Spring Boot 标准玩法：基础库自带装配，使用方零配置即可享受全部 Bean。
+- **`@ConditionalOnProperty(matchIfMissing=true)`**：默认装配；`exchange.mq.enabled=false` 时整段绕开。Hooks 到 `KafkaConfig` 和 `ShedLockConfig` 上的同名条件，三处一致就能整体禁用。
+- **`@MapperScan` 显式列子包**：MyBatis-Plus 的 `@MapperScan` 不能直接装在 common 里扫 `com.exchange.common.mq` 全包——会扫到非 mapper 接口报错。**显式列出 mapper 所在的两个子包** `outbox` + `consumed` 更精准。
+- **`@ComponentScan` 限定在 mq 包内**：避免扫到 common 其他子包（`util` / `config` 等已经有自己的装配路径）。
+- **AutoConfiguration.imports 文件位置**：Spring Boot 2.7+ 弃用 `spring.factories`，新位置在 `META-INF/spring/org.springframework.boot.autoconfigure.AutoConfiguration.imports`，每行一个全限定类名。
+- **顺序无关**：本期没有显式 `@AutoConfigureBefore/After`。Bean 之间通过依赖注入自然排序。如果将来出现循环依赖（比如 KafkaConfig 依赖 MqMetrics、MqMetrics 又监听 KafkaTemplate），再用 `@AutoConfigureOrder` 拆。
+
+**易踩的坑**：
+
+- 忘了写 `imports` 文件，只放 `@Configuration` 类：使用方启动时这个类不会被发现，所有 Bean 都不存在但不报错——业务代码注入 `EventPublisher` 时才在启动期失败，难定位。
+- 把 `MqAutoConfiguration` 写到 `bootstrap` 模块：违反"common 自带装配"的设计，且循环依赖 bootstrap → common → bootstrap。
+- `@MapperScan` 写错路径：MyBatis 启动期会报"NoClassDefFoundError"或"Property 'sqlSessionFactory' is required"。复查 `imports` 文件列出的 base packages。
+
 **Files:**
 - Create: `common/src/main/java/com/exchange/common/mq/MqAutoConfiguration.java`
 - Create: `common/src/main/resources/META-INF/spring/org.springframework.boot.autoconfigure.AutoConfiguration.imports`
@@ -1607,6 +1894,47 @@ git commit -m "feat(mq): autoconfiguration entry"
 ```
 
 ### Task 18: common-mq 集成测试（Testcontainers Kafka + MySQL）
+
+**设计考虑**：
+
+```mermaid
+flowchart LR
+    JUnit[JUnit 5] --> SBT["@SpringBootTest<br/>MqTestApplication"]
+    SBT --> TC["@Testcontainers<br/>MySQLContainer"]
+    SBT --> EK["@EmbeddedKafka<br/>partitions=1"]
+    TC --> DPS["@DynamicPropertySource<br/>注入 jdbc-url + bootstrap-servers"]
+    EK --> DPS
+    DPS --> Ctx[Spring Context]
+    Ctx --> TEP[TransactionalEventPublisher]
+    Ctx --> Relay[OutboxRelay]
+    Ctx --> Mapper[OutboxMapper]
+
+    Test[测试用例] --> Tx["TransactionTemplate<br/>显式开事务"]
+    Tx --> TEP
+    TEP --> OB[(outbox PENDING)]
+    OB -. 1秒后 .-> Relay
+    Relay --> EK
+    Test --> Await["Awaitility 轮询<br/>无 PENDING 行 = 已发出"]
+```
+
+**关键决策**：
+
+- **MySQL 用 Testcontainers，Kafka 用 EmbeddedKafka**：
+  - MySQL 用 Testcontainers：版本与生产严格一致（mysql:8.0），跑 Flyway 迁移验证 DDL 正确性；EmbeddedMysql 已不再维护。
+  - Kafka 用 `@EmbeddedKafka`：spring-kafka-test 自带，启动比 KafkaContainer 快 5-10 秒，集成测试不需要测真 Kafka 的高级特性（如多 broker、partition reassign）。
+  - 取舍：Kafka 集群级行为（如 broker 故障切换）需要 KafkaContainer，本期不测；business 流程测试 EmbeddedKafka 够用。
+- **`@DynamicPropertySource` 替代 `application-test.yml` 硬编码**：MySQL 容器启动后才知道 jdbc-url（端口随机），EmbeddedKafka 的 `brokers` 也是运行时分配的。`DynamicPropertySource` 在 Spring Context 启动前注入到 `Environment`，YAML 占位符 `${mysql.url}` 才能解析。
+- **`MqTestApplication` 放 test 目录**：不污染 main 的启动入口；`@SpringBootApplication` 默认扫所在包，所以放 `com.exchange.common.mq` 包下能扫到所有 `@Component`。
+- **业务测试用 `TransactionTemplate` 而非 `@Transactional`**：`@Transactional` 在测试方法上的语义是"测试结束自动回滚"，与 `Propagation.MANDATORY` 配合 OK，但事务**不会真正 commit**——outbox 行根本没落表，Relay 看不到。所以**必须用 `TransactionTemplate.executeWithoutResult` 显式开事务并 commit**，让 outbox 行真实可见。
+- **`Awaitility` 而非 `Thread.sleep`**：异步流程的等待用轮询断言，最多等 10 秒。早达到立刻继续，慢一点也不会 sleep 死等。CI 环境时序波动大，`sleep(2s)` 经常 flaky。
+- **断言条件 `noneMatch eventId`**：不直接断言"SENT 行存在"——SENT 行可能被异步归档；用"PENDING 行不再含此 eventId" 反向证明已发送。
+
+**易踩的坑**：
+
+- 用 `@Transactional` 装饰整个测试方法 + 调 `TransactionalEventPublisher.publish`：方法结束 Spring 回滚事务，outbox 行被回滚没落表，Relay 永远看不到 → 测试超时失败。**必须用 TransactionTemplate**。
+- 容器启动慢导致测试超时：`MySQLContainer` 首次跑要拉镜像，CI 上配镜像缓存或预热。
+- `@EmbeddedKafka` 与 `KafkaTemplate` 的 bootstrap-servers 不一致：依赖 `spring.embedded.kafka.brokers` 系统属性传递；`@DynamicPropertySource` 必须显式 `add("kafka.bootstrap", () -> System.getProperty("spring.embedded.kafka.brokers"))`。
+- ShedLock 的锁残留：测试用同一张 shedlock 表，连续跑两个测试时上一轮锁还没过期 → 后一轮 Relay 不工作。可以在 `@AfterEach` 清空 shedlock 表，或者把 `lockAtMostFor` 在 mqtest profile 里调成 5s。
 
 **Files:**
 - Create: `common/src/test/java/com/exchange/common/mq/MqIntegrationTest.java`
