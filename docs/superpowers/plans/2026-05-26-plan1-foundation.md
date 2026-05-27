@@ -114,6 +114,47 @@
 
 ## Phase 1 — 父 pom 版本管理
 
+### 全景：为什么先做版本管理
+
+整个 Plan 1 引入 7 个新的依赖族，分散在 4 个模块（common / wallet / bootstrap / 测试）。如果每个子模块各自写死版本号，半年后升级 Spring Kafka 一个小版本就要改 N 处 pom，且容易留下"common 用 3.2.4、wallet 用 3.1.x"的版本撕裂。
+
+**做法**：所有第三方依赖的版本号**只在父 pom 的 `<properties>` 里定义一次**，子模块的 `<dependencies>` 不写 `<version>`，靠继承父 pom 的 `dependencyManagement` 兜版本。
+
+```mermaid
+flowchart LR
+    Parent["父 pom<br/>properties: 版本号<br/>dependencyManagement: 版本兜底"]
+    Common[common pom<br/>只声明 artifact]
+    Wallet[wallet pom<br/>只声明 artifact]
+    Boot[bootstrap pom<br/>只声明 artifact]
+
+    Parent --> Common
+    Parent --> Wallet
+    Parent --> Boot
+```
+
+| 依赖 | 版本 | 在 Plan 1 的用途 | 后续 Plan 的用途 |
+|---|---|---|---|
+| spring-kafka | 3.2.4 | KafkaTemplate / KafkaListener / DefaultErrorHandler（Task 13/15/16） | 各业务事件 listener |
+| shedlock | 5.16.0 | OutboxRelay 多实例互斥（Task 15） | scanner / sweep / treasury 定时任务全用 |
+| bouncycastle | 1.78.1 | AES-GCM 加密 + secp256k1（Task 23/24/26） | BTC / ETH / TRON 各链签名 |
+| web3j-crypto | 4.12.2 | BIP-32/39/44 派生 + Keccak（Task 25/26） | ETH 链签名（Plan 2） |
+| testcontainers | 1.20.4 | MySQL 集成测试（Task 18/37） | 各链 e2e 测试 |
+| micrometer | 1.13.6 | MQ + Ledger Prometheus 指标 | 全栈监控 |
+| spring-statemachine | 4.0.0 | 不在 Plan 1 用 | withdraw / sweep 状态机（Plan 2/3） |
+
+**版本选型原则**：
+
+- **跟 Spring Boot BOM 走的不要在父 pom 重定义**：jackson / mybatis / mysql-connector 等已经在 spring-boot-dependencies 里管好，再写一遍版本属性反而容易和 BOM 不一致。
+- **必须显式管的是非 BOM 内的依赖**：spring-kafka 虽然 Spring 系，但版本要和 broker 兼容，单独管控；shedlock / bouncycastle 完全外部，必须管。
+- **testcontainers 用 BOM 而非单 artifact**：`testcontainers-bom` 一次性兜住 mysql / kafka / junit-jupiter 几个子模块的版本，避免内部不一致。
+- **statemachine 4.0.0 vs 3.x**：4.0 已正式 GA 兼容 Spring 6 / Java 17+，与 Spring Boot 3.3 匹配。
+
+**易踩的坑**：
+
+- 父 pom 改了版本属性但没改 dependencyManagement：子模块仍取旧版本，因为 dependencyManagement 才是真正生效的兜底；只改 `<properties>` 的字符串等于没改。
+- testcontainers 用 BOM 后，子模块仍写死版本：BOM 失效，子模块版本胡乱漂移。子模块只写 `<groupId>` + `<artifactId>`，**不写 version**。
+- `mvn dependency:resolve -pl common` 失败：通常是父 pom 还没 install 到本地仓库（或缺少 jjwt-api 之类已有依赖的兼容版本）。先 `mvn install -N -DskipTests`（仅装父 pom）。
+
 ### Task 1: 在父 pom 中追加新依赖的版本属性与 dependencyManagement
 
 **Files:**
@@ -192,6 +233,65 @@ git commit -m "build: add kafka/shedlock/bc/web3j-crypto/testcontainers/statemac
 ---
 
 ## Phase 2 — 数据库 V2 迁移：16 张业务表 + outbox + consumed_record + shedlock
+
+### 全景：表分组与 ER 关系
+
+19 张表按职责分 7 组：
+
+```mermaid
+erDiagram
+    coin ||--o{ chain_config : "by chain"
+    coin ||--o{ account : "coin_id"
+    coin ||--o{ chain_tx : "coin_id"
+    coin ||--o{ deposit_order : "coin_id"
+    coin ||--o{ withdraw_order : "coin_id"
+    coin ||--o{ sweep_order : "coin_id"
+    coin ||--o{ treasury_movement : "coin_id"
+    coin ||--o{ treasury_policy : "coin_id"
+    coin ||--o{ address_balance : "coin_id"
+    coin ||--o{ reconcile_report : "coin_id"
+
+    wallet_address ||--|| key_material : "key_id"
+    wallet_address ||--o{ hd_path : "chain + hd_path"
+    wallet_address ||--o{ chain_tx : "to_address"
+    wallet_address ||--o{ nonce_register : "chain+address"
+    wallet_address ||--o{ address_balance : "chain+address"
+
+    account ||--o{ account_journal : "account_id"
+
+    chain_tx ||--o| deposit_order : "chain_tx_id"
+    withdraw_order ||--o| chain_tx : "tx_hash"
+
+    outbox }o..o{ consumed_record : "event_id (跨进程)"
+```
+
+**七组表的职责**：
+
+| 组 | 表 | 职责 |
+|---|---|---|
+| common-mq | outbox / consumed_record / shedlock | 消息总线基础设施（Phase 3） |
+| 资产配置 | coin / chain_config | 币种、链、确认数、提现限额 |
+| 地址与密钥 | wallet_address / hd_path / key_material | 地址、HD 派生路径占用、加密私钥 |
+| 账户与流水 | account / account_journal | 用户余额、双账法流水（核心） |
+| 链上交易 | chain_tx | 链上交易快照（含 reorg 状态） |
+| 业务流程 | deposit_order / withdraw_order / sweep_order / treasury_movement | 充值/提现/归集/冷热调拨工单 |
+| 归集与水位 | nonce_register / address_balance / treasury_policy | EVM nonce、地址余额缓存、冷热水位策略 |
+| 对账 | reconcile_report | 三层对账日报 |
+
+**全表共用约定**：
+
+- **主键**：除复合主键的几张（`account_journal` 单主键 id；`nonce_register` / `address_balance` 复合主键），其余统一 `BIGINT PRIMARY KEY`，由 Snowflake 生成 → 趋势递增、避免 InnoDB 页分裂。
+- **金额**：所有金额字段 `DECIMAL(38,18)`，38 位精度兼容 BTC / ETH（18 位小数）/ USDT 等所有现存代币的最小单位。**禁止**用 `DOUBLE`。
+- **时间戳**：`DATETIME(3)` 含毫秒；不用 `TIMESTAMP`（避免 2038 / 时区漂移）；记 `created_at` + `updated_at`。
+- **乐观锁**：会被并发 update 的表（account / *_order / nonce_register）加 `version INT NOT NULL DEFAULT 0`，CAS 更新时 `version=version+1 AND version=#{old}`。
+- **字符集**：全表 `utf8mb4`，避免地址 / payload 里出现非 BMP 字符炸表。
+- **Flyway 单文件 V2**：本期 16 张业务表 + 3 张消息表全部在 `V2__wallet_foundation.sql` 一个迁移内落盘，避免 PR review 时跨多个迁移找上下文。Plan 2/3/4/5 各自的新增字段走 V3/V4...。
+
+**关键决策**：
+
+- **不分库分表**：单库 InnoDB 撑得住——交易量 \* 流水放大系数（双账法 ≈ 2x）+ 7 年数据 ≈ 10 亿行级，热点表加分区 / 归档即可。
+- **不引 NoSQL 副存储**：对账要求强一致快照，MySQL 是真理之源；地址余额这种"可能不准、定时刷新"的也用同一个 MySQL，少一层心智负担。
+- **不用 Hibernate**：MyBatis-Plus 注解级 SQL + 复杂场景写 XML mapper，足够；ORM 在双账法这种"必须看到 SQL 形态"的场景反而是负担。
 
 ### Task 2: 拆分迁移脚本骨架
 
@@ -2069,7 +2169,84 @@ git commit -m "test(mq): integration test with testcontainers + embedded kafka"
 
 > 说明：本阶段只创建接口与 POJO DTO，没有运行期逻辑，因此跳过 TDD，单测在后续 Plan 实现具体链时落。
 
+### 全景：链抽象方向是单向的
+
+整个钱包要支持 BTC / ETH / TRON 三种完全不同的链模型（UTXO / Account+EVM / Account+Energy）。如果不抽象，各业务模块（scanner、withdraw、sweep）会被迫到处 `if (chain == BTC) ... else if (chain == ETH) ...`——再加一条链就要改全代码库。
+
+**方向**：业务模块（`wallet.core` / `wallet.scanner` / `wallet.withdraw` 等）**只依赖** `wallet.chain.api`（接口 + DTO），**绝不直接依赖** `wallet.chain.btc/eth/tron`。新增公链 = 新建 `wallet.chain.<name>` 子包实现 5 个 SPI，业务代码零改动。
+
+```mermaid
+flowchart TB
+    subgraph BIZ[业务层 chain-agnostic]
+        Core[wallet.core 双账法]
+        Scanner[wallet.scanner 扫块]
+        Withdraw[wallet.withdraw 提现]
+        Sweep[wallet.sweep 归集]
+    end
+
+    subgraph API[wallet.chain.api SPI 层]
+        ChainClient
+        TxBuilder
+        TxBroadcaster
+        TxParser
+        AddressDerivator
+        Signer
+
+        DTO[(链无关 DTO<br/>RawTx / SignedTx<br/>ChainTx / ChainBlock<br/>FeeQuote / KeyRef)]
+    end
+
+    subgraph IMPL[各链实现 Plan 2/4/5]
+        BTC[wallet.chain.btc]
+        ETH[wallet.chain.eth]
+        TRON[wallet.chain.tron]
+    end
+
+    BIZ --> API
+    API <-. impl .-> BTC
+    API <-. impl .-> ETH
+    API <-. impl .-> TRON
+
+    BIZ -. 禁止 .-x BTC
+    BIZ -. 禁止 .-x ETH
+    BIZ -. 禁止 .-x TRON
+```
+
+**5 个 SPI 接口的职责**：
+
+| SPI | 职责 | 典型实现 |
+|---|---|---|
+| `ChainClient` | 链上读：getBlock / getTx / getBalance / getOnChainNonce | Web3j RPC / bitcoinj P2P / trident gRPC |
+| `TxBuilder` | 构造未签名 RawTx：`(transferRequest, feeQuote) → RawTx` | 各链不同（EIP-1559 / PSBT / TriggerSmartContract） |
+| `TxBroadcaster` | 把 SignedTx 发到链 + 返回 txHash | sendRawTransaction / sendTransaction |
+| `TxParser` | 把链上交易解析成业务事件：识别 ERC20 Transfer / 内部转账 / coinbase / 多 input | 解 Log topics / 解 vout / 解 contract data |
+| `AddressDerivator` | 从公钥/HD path 派生地址 | EIP-55 / Bech32 / Base58 |
+
+`Signer` 是单独一类（在 `wallet.chain.api` 顶层而非 5 SPI 内）：业务侧拿到 `RawTx` 调 `Signer.sign(RawTx, KeyRef)` → `SignedTx`，签名实现细节（私钥获取 / 链特定签名算法）由 `wallet.signer` 统一封装，不让业务代码碰私钥。
+
+**链无关 DTO 的设计思路**：
+
+- **`RawTx` / `SignedTx` 是 byte[]+metadata**：不强行抽公共字段。BTC PSBT 和 ETH RLP 字节布局完全不同，只在容器上统一（含 chain / aggregateRef），具体序列化交给各链实现。
+- **`ChainTx`**：扫块产物，统一字段 `(chain, txHash, vout, blockHeight, blockHash, parentHash, fromAddress, toAddress, coinId, amount, direction, confirmCount, status, rawJson)`。`vout` 默认 0，BTC 多输出时 1 笔 tx 在多行——`uk(chain, tx_hash, vout)`保证幂等。
+- **`FeeQuote` / `FeeQuoteRequest`**：手续费估算的输入输出。具体策略在 `wallet.fee.FeeStrategy` 各链实现里。
+- **`KeyRef`**：不直接存私钥；只存 `keyId + hdPath + chain`，让 Signer 去查 `key_material` 表。
+
+**关键决策**：
+
+- **不抽公共基类**：用接口 + DTO，避免菱形继承。Java 21 的 sealed interface 也不用——会限制扩展性。
+- **不用 SPI 自动发现**（`ServiceLoader`）：直接用 Spring Bean + `Map<Chain, Bean>` 路由，可控、可测、可替换。
+- **DTO 都是 immutable record / Lombok @Value**：跨线程传递安全，签名前后字段不可变。
+
 ### Task 19: 在 wallet pom 加 web3j-crypto / bouncycastle / spring-kafka 依赖
+
+**设计考虑**：
+
+wallet 模块在本期开始引 4 类新依赖：
+
+- **web3j-crypto + bouncycastle**：HD 派生（BIP-32/39/44）+ AES-GCM 加密 + secp256k1 签名（Plan 2 ETH 用）。**只引 web3j-crypto** 而非完整 web3j——后者还包括 RPC 客户端等，不在 Plan 1 范围。
+- **spring-kafka**：业务事件 listener 需要（提现确认 / 充值入账等）。Producer 端通过 common-mq 走 outbox，但 Listener 端各业务模块直接用 `@KafkaListener`。
+- **测试相关**：spring-kafka-test、testcontainers/mysql/kafka 用于 Plan 2/3/4/5 的 e2e 测试。本期 wallet 模块还没集成测试，但提前把测试依赖加上避免后续每次都改 pom。
+
+**这一步只动 pom，不写代码**——`mvn -pl wallet -am compile` 验证 BUILD SUCCESS 即过。
 
 **Files:**
 - Modify: `wallet/pom.xml`
@@ -2125,6 +2302,43 @@ git commit -m "build(wallet): add bc/web3j-crypto/statemachine/risk deps"
 ```
 
 ### Task 20: Chain 枚举 + 链无关 DTO（一组）
+
+**设计考虑**：
+
+```mermaid
+flowchart LR
+    Req[TransferRequest<br/>业务调用入口] --> TB[TxBuilder.build]
+    TB --> Raw[RawTx<br/>未签名]
+    Raw --> Sign[Signer.sign]
+    Sign --> Signed[SignedTx]
+    Signed --> Bcast[TxBroadcaster.broadcast]
+    Bcast --> Hash[txHash]
+    Hash --> Q[ChainClient.getTx]
+    Q --> CT[ChainTx<br/>扫块产物]
+    CT --> Acct[wallet.core 入账]
+
+    Quote[FeeQuoteRequest] --> FS[FeeStrategy.quote]
+    FS --> FQ[FeeQuote]
+    FQ --> TB
+```
+
+**字段设计要点**：
+
+- **`Chain` 枚举**：`BTC / ETH / TRON`，加 `code()`（短码，用作 DB 字段值）。**不用整数枚举**——SQL 里 `chain = 'ETH'` 比 `chain = 1` 更可读。
+- **`TransferRequest`**：业务侧的转账请求，含 `(chain, coinId, fromAddress?, toAddress, amount, memo?)`。BTC 不一定需要 fromAddress（UTXO 选择由 builder 决定），所以可选。
+- **`RawTx`**：`(chain, payloadBytes, expectedTxHash?, metadata: Map<String,Object>)`。EVM 实现把 nonce / gasPrice 放 metadata；BTC 实现把 selectedUtxos 放 metadata。
+- **`SignedTx`**：`(chain, signedBytes, txHash)`。txHash 在签名后才确定。
+- **`ChainTx`**：与 DB 表对齐，方便 scanner 直接 `mapper.insert`。
+- **`KeyRef`**：`(keyId, hdPath, chain)`——只是个引用，Signer 去 `key_material` 表查。**不放私钥字段**。
+- **`DerivedAddress`**：`(address, hdPath, publicKey)`，`AddressDerivator.derive` 的返回。
+- **`FeeQuote`**：`(chain, feeAmount, feeUnit, breakdown: Map)`。EVM 的 breakdown 含 `maxFeePerGas / maxPriorityFeePerGas / gasLimit`，BTC 含 `satPerVByte / vsize`。
+- **`TxStatus`**：`PENDING / CONFIRMED / DROPPED / REPLACED`。"REPLACED" 给 EVM 提现加速场景预留。
+
+**关键决策**：
+
+- **DTO 用 Lombok `@Value` 而非 record**：record 在 Jackson 反序列化某些场景需要额外配置；项目其他地方都用 `@Value`，统一风格。
+- **`amount` 用 BigDecimal 而非链原生最小单位（wei / satoshi）**：业务层统一 `DECIMAL(38,18)`，链特定的精度转换（wei ↔ ether）在 chain 实现内做。
+- **不抽 `Tx` 通用基类**：不同链 raw 字节没有公共字段，硬抽是过度设计。
 
 **Files:**
 - Create: `wallet/src/main/java/com/exchange/wallet/chain/api/Chain.java`
@@ -2389,6 +2603,74 @@ git commit -m "feat(chain-api): Chain enum + 10 chain-agnostic DTOs"
 
 ### Task 21: 链抽象 SPI 接口（5 个）
 
+**设计考虑**：
+
+```mermaid
+sequenceDiagram
+    participant Biz as wallet.withdraw
+    participant Builder as TxBuilder (chain-specific)
+    participant Signer as Signer
+    participant Broad as TxBroadcaster
+    participant Client as ChainClient
+    participant Parser as TxParser
+
+    Biz->>Builder: build(transferRequest, feeQuote)
+    Builder-->>Biz: RawTx
+    Biz->>Signer: sign(RawTx, KeyRef)
+    Signer-->>Biz: SignedTx
+    Biz->>Broad: broadcast(SignedTx)
+    Broad-->>Biz: txHash
+
+    Note over Biz: 异步等待确认
+    loop 直到 confirmed
+        Biz->>Client: getTx(txHash)
+        Client-->>Biz: rawJson
+        Biz->>Parser: parse(rawJson)
+        Parser-->>Biz: ChainTx
+    end
+```
+
+**5 个接口的方法签名约定**：
+
+```java
+interface ChainClient {
+    Chain chain();
+    ChainBlock getBlock(long height);
+    long getLatestHeight();
+    ChainTx getTx(String txHash);
+    BigDecimal getBalance(String address, Long coinId);
+    long getOnChainNonce(String address);   // EVM 专用，UTXO 链返回 0
+}
+
+interface TxBuilder {
+    Chain chain();
+    RawTx build(TransferRequest req, FeeQuote fee);
+}
+
+interface TxBroadcaster {
+    Chain chain();
+    String broadcast(SignedTx signedTx);
+}
+
+interface TxParser {
+    Chain chain();
+    ChainTx parse(String rawJson);          // 单 tx
+    List<ChainTx> parse(ChainBlock block);  // 整块
+}
+
+interface AddressDerivator {
+    Chain chain();
+    DerivedAddress derive(byte[] publicKey, String hdPath);
+}
+```
+
+**关键决策**：
+
+- **每个接口都有 `chain()` 方法**：用于 Spring `Map<Chain, ChainClient>` 路由。Bean 启动时按 `chain()` 注册到 map。
+- **`getOnChainNonce` 在 ChainClient 而非单独抽象**：BTC/TRON 返回 0 即可（业务层 nonce 分配只对 EVM 生效）；不为这一个方法多抽一层。
+- **`TxParser.parse` 双签名**：scanner 整块解析快，单 tx 查询用得上单 tx 解析。
+- **不在 SPI 暴露 raw RPC 客户端**：`ChainClient` 是高层抽象；如果某个链的高级特性需要业务层用（罕见），单独加方法到 SPI，不绕过抽象。
+
 **Files:**
 - Create: `wallet/src/main/java/com/exchange/wallet/chain/api/ChainClient.java`
 - Create: `wallet/src/main/java/com/exchange/wallet/chain/api/TxBuilder.java`
@@ -2484,6 +2766,39 @@ git commit -m "feat(chain-api): ChainClient/TxBuilder/TxBroadcaster/TxParser/Add
 
 ### Task 22: Signer 接口
 
+**设计考虑**：
+
+`Signer` 单独抽出来不归入 5 SPI：业务层（withdraw / sweep）调用 `Signer.sign(rawTx, keyRef)` 拿到 `SignedTx`，**永远不应接触私钥字节**。私钥的提取、解密、签名、清零，全在 `wallet.signer` 包内闭环。
+
+```mermaid
+flowchart LR
+    Biz[业务层<br/>不接触私钥] --> S[Signer.sign]
+    S --> CSS[ChainSpecificSigner<br/>按 chain 路由]
+    CSS --> KMS[KmsProvider<br/>取出明文私钥 byte]
+    KMS --> Algo[secp256k1 / EdDSA<br/>签名计算]
+    Algo --> Wipe[byte[] 清零]
+    Wipe --> Out[SignedTx 返回]
+
+    Biz -. 禁止 .-x KMS
+    Biz -. 禁止 .-x Algo
+```
+
+接口长这样：
+
+```java
+interface Signer {
+    SignedTx sign(RawTx rawTx, KeyRef keyRef);
+}
+```
+
+**关键决策**：
+
+- **Signer 不是 5 SPI 之一**：5 SPI 各链一份实现（`btcChainClient` / `ethChainClient`），但 **Signer 只有一份默认实现**（`SignerImpl`），内部按 chain 路由到 `ChainSpecificSigner` 子接口。这样业务层依赖一个 `Signer` Bean，不需要 chain 路由。
+- **入参 `KeyRef` 而非私钥**：Signer 自己去 KmsProvider 取私钥；调用方拿不到、也不应该拿到私钥。
+- **`KeyRef.hdPath` 必填**：哪怕同一个 keyId 也可能派生多个子私钥（每个地址一条 hdPath），KeyRef 必须含 hdPath 才能精确定位。
+
+详细的 ChainSpecificSigner / KmsProvider / 清零机制在 Phase 5 落地。本 Task 只定接口签名。
+
 **Files:**
 - Create: `wallet/src/main/java/com/exchange/wallet/chain/api/Signer.java`
 
@@ -2518,6 +2833,266 @@ git commit -m "feat(chain-api): Signer SPI"
 ---
 
 ## Phase 5 — wallet.signer：密钥与签名
+
+### 全景：私钥生命周期 + 签名隔离
+
+钱包的命门是私钥。本 Phase 把"如何派生 → 如何加密 → 如何存 → 如何用 → 如何清零"五件事彻底封闭在 `wallet.signer` 子包内，业务代码通过 `KeyRef` + `Signer` 间接使用，永远拿不到明文私钥字节。
+
+```mermaid
+flowchart LR
+    subgraph Born[1. 派生]
+        M[BIP-39 助记词] --> S[Seed 64B]
+        S --> Master[BIP-32 主私钥]
+        Master --> Child["子私钥<br/>m/44'/coin'/0'/0/index"]
+    end
+
+    subgraph Store[2. 存储]
+        Child --> Cipher[AES-256-GCM 加密]
+        Cipher --> KM[(key_material 表<br/>iv + cipher)]
+    end
+
+    subgraph Use[3. 使用]
+        Sign[Signer.sign] --> KMS[KmsProvider.fetch]
+        KMS --> KM
+        KM --> Plain[明文私钥 byte 数组]
+        Plain --> Algo[secp256k1 签名]
+        Algo --> Wipe[Arrays.fill 0 清零]
+    end
+```
+
+**Phase 5 内部分工**：
+
+| Task | 组件 | 职责 |
+|---|---|---|
+| 23 | `AesGcmCipher` | AES-256-GCM 工具类 + `wipe` 清零工具 |
+| 24 | `KmsProvider` 接口 + `LocalKeystoreKmsProvider` | KMS 抽象 + 本地 keystore 实现（生产替换为 AWS KMS / HashiCorp Vault） |
+| 25 | `Bip39MnemonicService` | 助记词生成 / 校验 / 转 seed |
+| 26 | `Bip32HdKeyDeriver` | 主私钥派生 + 子私钥派生（BIP-44 路径） |
+| 27 | `KeyMaterial` 实体 + Service | 加密私钥落 DB + 取出解密 |
+| 28 | `ChainSpecificSigner` + `SignerImpl` | 链特定签名 + 路由 + 私钥清零 |
+
+**关键决策**：
+
+- **AES-256-GCM 而非 AES-CBC**：GCM 自带认证（防篡改），CBC 必须额外配 HMAC，多一步出错的可能。GCM 的 12B IV + 16B Tag 是工业标准。
+- **KmsProvider 是抽象**：本期落地本地 keystore（用主密钥加密 keystore 文件、再用 keystore 解每条 key_material）；生产环境替换为云 KMS（KeyId 是云 KMS 的 ARN）即可，业务代码不动。
+- **只在内存中持有明文私钥几毫秒**：`fetch → sign → wipe` 在同一个方法栈内完成，不放 ThreadLocal、不放 Bean 字段、不参与日志 / toString / 异常 message。
+- **`wipe` 不止是好习惯**：JVM heap 上的 byte[] GC 后字节可能在内存里残留任意长，触发 dump 时被读出。`Arrays.fill(privKey, (byte)0)` 立刻清零是基础动作。
+- **HD 派生路径用 BIP-44**：`m/44'/coinType'/account'/change/index`。coinType 按 SLIP-44 注册值（BTC=0、ETH=60、TRX=195）。
+- **不使用 `String` 持有私钥**：String 不可变 → 没法清零，留在 String pool 里直到 GC + 之后还可能在 dump 里。一律用 `byte[]` / `char[]`。
+
+**易踩的坑**：
+
+- 把私钥写日志：异常被 Spring 包装成 message 抛出 → 进 ELK → 永久外泄。所以**异常 message 严禁含私钥字节**；签名相关异常用通用文案 + 不带 cause 透传。
+- 私钥放进 toString：Lombok `@Data` 默认含 toString，私钥字段必须 `@ToString.Exclude`。
+- 同 hdPath 重复派生且重复落表：`uk_key_id` 防止；同时业务层用 `hd_path` 表保留"已用 path"避免重复分配。
+- KmsProvider 实现忘了清零它内部用的中间 byte[]：审计时审到自己实现的 Provider 全链路。
+
+---
+
+> **以下是 Phase 5 内 Task 23-28 的逐项设计考虑**——每段在自己 Task 实现前。先通读概览，再到 Task 章节看 Step 步骤。
+
+#### Task 23 设计考虑：AES-GCM 加密工具
+
+**设计考虑**：
+
+```mermaid
+flowchart LR
+    Plain[plaintext byte] --> Encrypt[encrypt key, plaintext]
+    Encrypt --> IV[随机 12B IV]
+    Encrypt --> Cipher[ciphertext + 16B tag]
+    Encrypt --> Wipe1[Arrays.fill plaintext]
+
+    IV2[同一 IV] --> Decrypt
+    Cipher2[同一 cipher] --> Decrypt
+    Decrypt --> Plain2[plaintext]
+    Decrypt --> Verify[GCM tag 校验]
+```
+
+**接口约定**：
+
+```java
+class AesGcmCipher {
+    record Encrypted(byte[] iv, byte[] cipher) {}
+    Encrypted encrypt(byte[] key, byte[] plaintext);
+    byte[] decrypt(byte[] key, byte[] iv, byte[] cipher);  // tag 校验失败抛 AEADBadTagException
+    static void wipe(byte[] sensitive);
+}
+```
+
+**关键决策**：
+
+- **IV 用 SecureRandom 12B 随机**：GCM 推荐 12B。**严禁固定 IV**——同 key 重用 IV = AES-GCM 的灾难（可被逆推 key）。
+- **Tag 长度固定 16B (128 bit)**：标准强度。8B 也能用但安全余量低。
+- **加密返回 `(iv, cipher)` 二元组**：调用方分别落 DB 字段 `iv` 和 `cipher_text`，方便审计和换密钥。
+- **`wipe` 静态方法**：`Arrays.fill(buf, (byte)0)` 包一层语义化命名，让代码 review 时一眼看到"这里在清零"。
+- **Bouncy Castle vs JDK 默认**：JDK 自带 AES-GCM 已经够用；引 BC 是为了某些链特殊算法（secp256k1 等）。AES 用 JDK 默认 provider 即可，性能通常更好。
+
+**易踩的坑**：
+
+- IV 用 `new byte[12]`（全 0）：全 0 IV 加密同 key + 不同 plaintext 仍会泄漏 XOR 关系，不安全。**必须 SecureRandom**。
+- 用 `String(plaintext)` 做日志：byte[] 转 String 后清零无意义（String 不可变）。
+- 解密失败的异常 message 含 cipher：cipher 本身不敏感（缺 key 解不开），但仍按"不写敏感字段"原则处理。
+
+#### Task 24 设计考虑：KmsProvider 抽象
+
+```mermaid
+flowchart TB
+    App[业务进程] --> KP[KmsProvider 接口]
+
+    subgraph Local[本期：LocalKeystoreKmsProvider]
+        KP --> KS[(本地 keystore 文件)]
+        KS --> MK[主密钥<br/>加密 keystore 解锁]
+        MK --> DK[数据密钥<br/>加密 key_material]
+    end
+
+    subgraph Cloud[生产：AwsKmsProvider 等]
+        KP -.替换.-> KMS[云 KMS 服务<br/>HSM 内]
+        KMS -.encrypt/decrypt.-> Cipher[密文落 key_material]
+    end
+```
+
+**接口约定**：
+
+```java
+interface KmsProvider {
+    /** 用 KMS 加密明文，返回密文 + IV + KMS alias */
+    Encrypted wrap(byte[] plaintext);
+
+    /** 用 KMS 解密 */
+    byte[] unwrap(byte[] iv, byte[] cipher, String kmsAlias);
+}
+```
+
+**关键决策**：
+
+- **接口先于实现**：业务代码绑接口，不绑 LocalKeystoreKmsProvider。生产换云 KMS 时只是换 Bean，调用代码零改动。
+- **本期实现用本地 keystore 而非"裸明文密钥"**：keystore 用 PBE-SHA256 + AES + 密码（启动时由运维输入）解锁，再持有数据密钥；keystore 文件即使丢也无法直接拿到数据密钥。
+- **`kms_alias` 字段**：每条 `key_material` 记录用哪个 KMS key 加密。轮换 KMS 主密钥时新数据写新 alias，老数据沿用旧 alias，逐步迁移。
+- **不暴露主密钥本身**：本地实现里主密钥也是 byte[] 形式只在 Provider 内存活，对外只暴露 wrap/unwrap。
+
+#### Task 25 设计考虑：BIP-39 助记词
+
+```mermaid
+flowchart LR
+    R[SecureRandom 128/256 bit 熵] --> Words[2048 词表查表]
+    Words --> Mnemonic[12/24 词助记词]
+    Mnemonic --> PBKDF2[PBKDF2 HMAC-SHA512<br/>2048 iter + passphrase]
+    PBKDF2 --> Seed[64B Seed]
+```
+
+**关键决策**：
+
+- **熵长度选 256 bit（24 词）**：12 词足够安全，但 24 词是行业默认（Ledger/Trezor），更利于跨钱包导入导出。
+- **`passphrase` 可选**：作为助记词后接的"二次密码"参与 PBKDF2；本期默认空 passphrase，结构上预留。
+- **生成助记词的 SecureRandom 必须用真 RNG**：`SecureRandom.getInstanceStrong()` 在 Linux 走 `/dev/random`。容器化环境注意熵池——可装 `haveged` / `rng-tools`。
+- **助记词只在生成时可见，立即加密落 key_material 然后清零**：明文助记词不留任何可恢复痕迹（不日志、不 stdout、不 toString）。
+- **校验位**：BIP-39 后 4 bit 校验，工具实现要校验导入的助记词合法性，不让坏助记词进系统。
+
+#### Task 26 设计考虑：BIP-32/44 HD 派生
+
+```mermaid
+flowchart TB
+    Seed[64B Seed] --> Master["BIP-32 Master Key<br/>HMAC-SHA512('Bitcoin seed', seed)"]
+    Master --> Acct["m/44'/coin'/0'<br/>账户级"]
+    Acct --> Change["m/44'/coin'/0'/0<br/>外部链"]
+    Change --> Idx["m/44'/coin'/0'/0/index<br/>地址级"]
+    Idx --> Pub[公钥]
+    Idx --> Priv[私钥]
+    Pub --> Addr[地址<br/>EIP-55 / Bech32 / Base58]
+```
+
+**关键决策**：
+
+- **路径用 BIP-44 标准**：`m/44'/coinType'/account'/change/index`。`coinType` 用 SLIP-44 注册值（BTC=0、ETH=60、TRX=195）。
+- **Hardened derivation（带撇号 `'`）只用前三段**：`m/44'/coin'/account'`。change / index 用非 hardened，方便给观察钱包导出 xpub。
+- **`hd_path` 表**：记"哪条链的哪个 index 已分配"，避免重复派生同一地址。本期顺序分配，未来可改"哈希到非顺序 index"做隐私增强。
+- **派生过程是确定性的**：同 seed + 同 path = 同私钥。这是冷热分层 + 灾备恢复的基础。
+- **不使用 ED25519 / SR25519**：BTC/ETH/TRON 都是 secp256k1，统一一套派生即可。
+
+#### Task 27 设计考虑：KeyMaterial 持久化
+
+```mermaid
+flowchart LR
+    Gen[Bip32HdKeyDeriver] --> Priv[私钥 byte]
+    Priv --> KMS[KmsProvider.wrap]
+    KMS --> Iv[iv]
+    KMS --> Cipher[cipher_text]
+    Iv --> Save[KeyMaterialService.save]
+    Cipher --> Save
+    Save --> DB[(key_material 表)]
+    Save --> Wipe[wipe priv]
+
+    Use[Signer.sign] --> Fetch[KeyMaterialService.fetch]
+    Fetch --> DB
+    DB --> KMS2[KmsProvider.unwrap]
+    KMS2 --> Plain[明文 byte 仅栈帧内存活]
+    Plain --> Sign[签名]
+    Sign --> Wipe2[wipe]
+```
+
+**关键决策**：
+
+- **`key_id` 是业务标识**：通常用雪花 ID 或 `<chain>-<aggregateId>` 形式。`key_material` 表 + `wallet_address` 表通过 `key_id` 关联。
+- **`algo_version` 字段**：当前固定 1（AES-256-GCM）。预留升级到 AES-256-SIV / 国密 SM4-GCM 的迁移空间。
+- **`KeyMaterialService.fetch` 返回 byte[]**：调用方（`SignerImpl` 内部）签完立刻 wipe；不要返回 String、不要 hex-encode。
+- **不缓存 fetch 结果**：每次签名都现解密，避免长期持有明文。性能开销几毫秒可接受。
+- **批量预派生**：地址池是预派生的（`AddressPoolService`，Task 38），所以 KeyMaterialService 高频用在写入侧；读取侧只在签名时触发。
+
+#### Task 28 设计考虑：Signer 路由 + 私钥清零
+
+```mermaid
+flowchart LR
+    Biz[业务] --> Sign[SignerImpl.sign]
+    Sign --> Route{按 rawTx.chain 路由}
+    Route -- BTC --> BCS[BtcSigner<br/>secp256k1 + Bitcoin DER]
+    Route -- ETH --> ECS[EthSigner<br/>secp256k1 + EIP-1559]
+    Route -- TRON --> TCS[TronSigner<br/>secp256k1 + Tron Tx]
+
+    BCS --> KM[KeyMaterialService]
+    ECS --> KM
+    TCS --> KM
+
+    KM --> Plain[明文 byte]
+    BCS -. sign + wipe .-> Out
+    ECS -. sign + wipe .-> Out
+    TCS -. sign + wipe .-> Out
+    Out[SignedTx]
+```
+
+**接口约定**：
+
+```java
+interface ChainSpecificSigner {
+    Chain chain();
+    SignedTx sign(RawTx rawTx, byte[] privKey);   // privKey 由调用方负责清零
+}
+
+@Component
+class SignerImpl implements Signer {
+    SignedTx sign(RawTx raw, KeyRef ref) {
+        ChainSpecificSigner css = router.get(raw.chain());
+        byte[] priv = keyMaterialService.fetch(ref);  // 内部已 unwrap
+        try {
+            return css.sign(raw, priv);
+        } finally {
+            AesGcmCipher.wipe(priv);   // 必清
+        }
+    }
+}
+```
+
+**关键决策**：
+
+- **`SignerImpl` 是单例**：业务依赖一个 `Signer` Bean；按 chain 路由对调用方透明。各链的 `ChainSpecificSigner` 实现在 Plan 2/4/5 各自的 chain 子包内提供。
+- **`fetch` + `sign` + `wipe` 在 try/finally 同栈帧**：哪怕 sign 抛异常也保证清零。
+- **`ChainSpecificSigner.sign` 不直接接 KeyRef**：拿 byte[] 私钥是设计选择——隔离"取私钥"和"用私钥"两个职责，便于审计。
+- **没拿到对应链的 ChainSpecificSigner Bean → 启动期失败**：用 `Map<Chain, ChainSpecificSigner>` 注入，路由 miss 时立刻抛错；不要运行期才发现。
+
+**易踩的坑**：
+
+- `ChainSpecificSigner` 实现内部把 `priv` 转成了 BC 的 `BigInteger`（不可清零）：BC API 不可避免要传 BigInteger，**但 BigInteger 用完后无法清零**。妥协办法：让 `priv` 在 `BigInteger` 化前后都尽快脱离作用域，签完 `priv = null` + 触发 GC 也只是 best effort。安全上限于 BC 的 API 设计，已知不完美但不可越过。
+- 多线程并发调 `sign`：每次 `fetch` 都新 byte[]，无共享，线程安全。但 `KmsProvider.unwrap` 内部如果用了非线程安全的 `Cipher` 实例（JDK 默认行为）会出错——本期实现确保每次新建 `Cipher` 实例。
+
 
 ### Task 23: AES-GCM 加密工具 + 单测
 
@@ -3248,6 +3823,60 @@ git commit -m "feat(signer): SignerImpl with chain routing and post-use key wipe
 
 ## Phase 6 — wallet.nonce：并发 nonce 分配
 
+### 全景：为什么 nonce 是 EVM 世界的隐形一等公民
+
+EVM 链（ETH / BSC / Polygon...）的每笔交易必须带一个**严格连续递增**的 nonce。同一地址第 N+1 笔提现要等第 N 笔的 nonce 被链处理才能广播——nonce=5 还没上链，发了 nonce=6，链上节点会拒收（"nonce too high"）；nonce=5 已上链，再发 nonce=5，链拒（"nonce too low"）；同 nonce 两笔不同 gasPrice = "替换交易"（用于加速 / 取消）。
+
+单笔可控；麻烦在**并发**：交易所每秒可能并发处理几十笔提现，全部从同一个热钱包出账。这时多线程都要对同一地址发号 nonce，不能撞、不能跳、不能丢。
+
+```mermaid
+flowchart TB
+    subgraph Concurrent[并发提现]
+        T1[线程1<br/>提现 0.5 ETH]
+        T2[线程2<br/>提现 1.2 ETH]
+        T3[线程3<br/>提现 0.3 ETH]
+    end
+
+    Alloc[NonceAllocator]
+    DB[(nonce_register<br/>chain+address PK<br/>next_nonce + version)]
+    Cache[(Redis Lua<br/>兜底分配)]
+    Reconciler[NonceReconciler<br/>启动校准 + 定时巡检]
+    Chain[链上 RPC<br/>getOnChainNonce]
+
+    T1 --> Alloc
+    T2 --> Alloc
+    T3 --> Alloc
+
+    Alloc -- 主路径 --> DB
+    Alloc -. 降级 .-> Cache
+
+    Reconciler --> Chain
+    Reconciler --> DB
+```
+
+**Phase 6 内部分工**：
+
+| Task | 组件 | 职责 |
+|---|---|---|
+| 29 | `NonceRegister` 实体 + Mapper | DB 表与 CAS 更新 SQL |
+| 30 | `NonceAllocator` 接口 + `DbOptimisticNonceAllocator` | 三级保障：DB 乐观锁主、Redis Lua 兜底、启动校准 |
+
+**关键决策**：
+
+- **`(chain, address)` 复合主键 + `next_nonce` + `version`**：DB 是真理之源；分配 nonce = `UPDATE nonce_register SET next_nonce=next_nonce+1, version=version+1 WHERE chain=? AND address=? AND version=#{old}`。CAS 失败 = 并发冲突，重试。
+- **Redis Lua 仅作兜底**：`INCR nonce:eth:0xabc...`。仅在 DB 暂时不可用时降级使用，恢复后用 `Reconciler` 把 Redis 的高水位写回 DB。生产路径不依赖 Redis 一致性。
+- **`NonceReconciler` 启动校准 + 定时巡检**：进程启动时用 `ChainClient.getOnChainNonce(address)` 拿链上已用最大 nonce，写到 `on_chain_nonce`；如果 DB 的 `next_nonce` < 链上 nonce + pending 数，说明丢号，按链上的实际值修正。
+- **不用 ZK / etcd**：MySQL 完全够用，引 ZK 是额外运维负担。
+- **不用 synchronized 进程内串行**：单进程内 synchronized 看似简单，但多副本部署立刻失效；DB 乐观锁天然分布式安全。
+- **CAS 重试有上限**：默认 5 次，超过则抛 `RetriableException` 让上层退避；不要无限重试制造雪崩。
+
+**易踩的坑**：
+
+- 提现广播失败但不回滚 nonce：链上没消耗这个 nonce，DB 还往前走 → "nonce 空洞"，所有后续提现卡在那里。需要业务侧捕获广播异常 + 显式调 `NonceReconciler` 矫正。
+- 提现加速场景：相同 nonce + 更高 gasPrice 替换。**不要再分配新 nonce**——直接用 withdraw_order 里已有的 nonce 字段。这要靠业务层正确建模而非 NonceAllocator 内部判断。
+- 启动校准前就处理提现：链上 nonce=10，DB 还是 0，第一笔提现拿到 nonce=0，被链拒。所以启动校准必须在 web server ready 之前完成。
+- 多个进程都跑 reconcile：用 ShedLock `nonce-reconcile` 锁互斥。
+
 ### Task 29: NonceRegister 实体 + Mapper
 
 **Files:**
@@ -3346,6 +3975,46 @@ git commit -m "feat(nonce): NonceRegister entity/mapper with CAS increment"
 ```
 
 ### Task 30: NonceAllocator 接口 + DB 乐观锁实现
+
+**设计考虑**：
+
+```mermaid
+flowchart TB
+    Start[allocate chain, address] --> Read[SELECT next_nonce, version]
+    Read --> CAS[UPDATE SET next_nonce+1<br/>WHERE version=#old]
+    CAS -- affected=1 --> Ret[返回 next_nonce-1]
+    CAS -- affected=0 --> Retry{重试 < 5?}
+    Retry -- 是 --> Read
+    Retry -- 否 --> RE[抛 RetriableException]
+
+    Ret -- 异常未广播 --> Rev[NonceReconciler 校准]
+```
+
+**接口约定**：
+
+```java
+interface NonceAllocator {
+    /** 占用并返回下一个可用 nonce；失败抛 RetriableException */
+    long allocate(Chain chain, String address);
+
+    /** 广播失败时归还 nonce（next_nonce-1，仅当当前 next_nonce=#allocated+1） */
+    void release(Chain chain, String address, long allocatedNonce);
+}
+```
+
+**关键决策**：
+
+- **CAS 而非 SELECT FOR UPDATE**：行锁会阻塞别的事务（提现高并发下退化为串行），CAS 不阻塞、自旋重试，吞吐高。
+- **`release` 难做完美**：分配后 → 别的线程已分配过更大 nonce → release 不能简单减回去。**做法**：release 只在 `next_nonce == allocated + 1` 时成功；否则记录 nonce 空洞由 Reconciler 处理。
+- **`Reconciler` 周期 5 分钟**：用 ShedLock 互斥；对每个监控地址查 `getOnChainNonce` + `withdraw_order WHERE status IN (BROADCASTED, CONFIRMED) AND chain=? AND from_address=?` 的最大 nonce，三者比对。
+- **不在 NonceAllocator 内部做广播**：分配 nonce 和广播交易是两个责任。Allocator 只管发号，广播由 withdraw 状态机处理。
+- **`allocate` 必须在业务事务外调用**：本步骤是独立短事务，与业务事务解耦。如果嵌入业务事务，业务事务一长就持锁久 → 别的线程 CAS 失败重试不断。
+
+**易踩的坑**：
+
+- 把 `allocate` 放到业务 `@Transactional` 内：业务回滚 nonce 没释放（业务事务回滚 ≠ Allocator 事务回滚，二者不同事务），nonce 浪费。本期把 `allocate` 设计成独立事务（`Propagation.REQUIRES_NEW`）。
+- 提现失败重试时复用旧 nonce：业务层必须先 `release` 老 nonce 再 `allocate` 新 nonce；或更简单的——失败重试只重试广播本身，不再分新 nonce。
+- 多链 / 同地址：复合主键含 chain，互不干扰。但同链同地址（多个热钱包共用一个？）必须强制约束"一地址只属于一种角色"。
 
 **Files:**
 - Create: `wallet/src/main/java/com/exchange/wallet/nonce/NonceAllocator.java`
@@ -3490,7 +4159,78 @@ git commit -m "feat(nonce): NonceAllocator with DB optimistic CAS + reconcile"
 
 ## Phase 7 — wallet.fee：手续费抽象
 
+### 全景：手续费的链间差异
+
+每条链的手续费模型差到无法共用一套字段：
+
+```mermaid
+flowchart LR
+    subgraph BTC[BTC sat/vB]
+        BV[vsize 估算] --> BS[satPerVByte]
+        BS --> BT[total = vsize * sat/vB]
+    end
+
+    subgraph ETH[ETH EIP-1559]
+        EE[gasLimit 估算] --> EM[maxFeePerGas]
+        EM --> EP[maxPriorityFeePerGas]
+        EP --> ET[total = gasLimit * gasPrice]
+    end
+
+    subgraph TRON[TRON energy/bandwidth]
+        TE[energy 估算] --> TF[fee_payer 模式]
+        TF --> TT[bandwidth 计算 + sun]
+    end
+```
+
+| 链 | 单位 | 估算依赖 | 加速机制 |
+|---|---|---|---|
+| BTC | sat/vB | mempool feerate / `estimatesmartfee` | RBF |
+| ETH | wei (gas) | 最近块 baseFee + priorityFee | 同 nonce 替换 |
+| TRON | sun (energy + bandwidth) | 合约调用估算 + 主账户质押情况 | fee_payer 代付 |
+
+`wallet.fee.FeeStrategy` 给一个统一接口，业务层（withdraw / sweep）调它估算手续费、不关心底下是 BTC 还是 ETH；具体策略实现 **在各链 plan 里落地**（Plan 2 ETH / Plan 4 BTC / Plan 5 TRON）。Plan 1 只搭骨架。
+
+**职责切分**：
+
+```mermaid
+flowchart LR
+    Biz[wallet.withdraw / sweep] --> FR[FeeStrategyRegistry]
+    FR -- by chain --> FS[FeeStrategy 接口]
+    FS -.impl.- ETH[EthFeeStrategy<br/>Plan 2]
+    FS -.impl.- BTC[BtcFeeStrategy<br/>Plan 4]
+    FS -.impl.- TRON[TronFeeStrategy<br/>Plan 5]
+```
+
 ### Task 31: FeeStrategy 接口 + Registry
+
+**设计考虑**：
+
+接口设计：
+
+```java
+interface FeeStrategy {
+    Chain chain();
+    /** 估算 fee；breakdown 含链特定字段 */
+    FeeQuote quote(FeeQuoteRequest req);
+}
+
+@Component
+class FeeStrategyRegistry {
+    private final Map<Chain, FeeStrategy> strategies;
+    public FeeStrategy of(Chain chain) {
+        FeeStrategy s = strategies.get(chain);
+        if (s == null) throw new IllegalStateException("no FeeStrategy for " + chain);
+        return s;
+    }
+}
+```
+
+**关键决策**：
+
+- **`FeeQuote.breakdown` 用 `Map<String, Object>`**：链特定字段塞进 map。EVM 放 `gasLimit / maxFeePerGas / maxPriorityFeePerGas`；BTC 放 `vsize / satPerVByte / utxoCount`；TRON 放 `energy / bandwidth / feePayer`。**业务层不要直接读 map**——具体链的 `TxBuilder` 和 `FeeStrategy` 有完整知识，业务只 `quote → 用作 builder 入参`。
+- **接口在 Plan 1 落、实现在各链 plan 落**：避免 Plan 1 引入 BTC / ETH / TRON 的 RPC 客户端依赖；本 Phase 只产出"业务能编译过 + 单元测试用 fake 实现"。
+- **不抽 `accelerate` 方法**：加速路径完全是链特定的——EVM 调高 gasPrice；BTC 调 RBF；TRON 不能加速（重发会被 dup 拦）。本期不抽，由各链的 `wallet.withdraw` 状态机处理。
+- **Registry 启动时填充**：用 Spring `Map<Chain, FeeStrategy>` 注入，由 `chain()` key 自动归类。多链实现时不需要手动注册。
 
 **Files:**
 - Create: `wallet/src/main/java/com/exchange/wallet/fee/FeeStrategy.java`
@@ -3603,6 +4343,90 @@ git commit -m "feat(fee): FeeStrategy SPI + Registry"
 ---
 
 ## Phase 8 — wallet.core：双账法账本 + 实体 + 地址池
+
+### 全景：双账法是钱包账本的命门
+
+任何资金移动都拆成"出"和"入"两条 journal 行，金额相等、direction 相反、`trace_id` 共享。这是会计学的复式记账法在交易所账本里的直接搬移：
+
+```mermaid
+flowchart LR
+    Biz[业务发起<br/>提现/充值/划转] --> Cmd[LedgerCommand<br/>含 traceId/bizType/bizId]
+    Cmd --> LS[LedgerService.transferAvailable]
+    LS --> J1[journal +1 入账]
+    LS --> J2[journal -1 出账]
+    LS --> A1[account UPDATE +金额]
+    LS --> A2[account UPDATE -金额]
+
+    UK[uk trace_id, direction, account_id] -.- J1
+    UK -.- J2
+
+    INV[凑零不变量<br/>同 trace_id 双行金额必相等]
+```
+
+**为什么必须双账**：
+
+- **可审计**：任意时刻 `SUM(journal) GROUP BY trace_id` 必为 0（金额相等、方向相反）；任何破坏不变量的 bug 一查即出。
+- **跨账户原子性**：用户 A 转账给用户 B，两个 account 行 UPDATE + 两条 journal 行 INSERT 在同一事务内完成。
+- **幂等保证**：`uk(trace_id, direction, account_id)` 让同一笔操作重试时第二次必被唯一约束挡掉。
+- **支持反向冲账**：reorg / 风控驳回 / 误操作时，反向 trace_id 写另一组双行——流水永不删除，只追加。
+
+**系统账户约定**：
+
+```mermaid
+flowchart TB
+    subgraph Sys[系统账户 user_id < 0]
+        S1[-1 入金中间账户<br/>充值临时存放]
+        S2[-2 主热钱包账户<br/>对应链上热钱包]
+        S3[-3 手续费账户<br/>所有矿工费聚集]
+        S4[-4 冻结缓冲账户<br/>提现冻结资金待广播]
+    end
+
+    User1[用户1] -->|deposit +| S1
+    S1 -->|内部结算 -| S2
+    S2 -->|提现 -| User1
+    User1 -->|提现 -| S4
+    S4 -->|广播 -| Out[链上]
+    Out -->|手续费 -| S3
+```
+
+**Phase 8 内部分工**：
+
+| Task | 组件 | 职责 |
+|---|---|---|
+| 32 | 14 张表 Entity | MyBatis-Plus `@TableName` POJO |
+| 33 | 14 张 Mapper | BaseMapper + 双账法专用自定义 SQL |
+| 34 | 系统账户常量 + 枚举 | `SystemAccountConstants` / `BizType` / `JournalDirection` |
+| 35 | `LedgerService` 接口 + DTO | 6 个语义化操作 + LedgerCommand |
+| 36 | `LedgerServiceImpl` | CAS 更新 account + 双 INSERT journal |
+| 37 | `LedgerServiceImplIT` | Testcontainers MySQL 验证双账平衡 + 幂等闸 |
+| 38 | `AddressPoolService` | 批量预派生地址 + 按需分配 + 失效回收 |
+| 39 | `WalletAutoConfiguration` | 子包被 bootstrap 扫描装配 |
+
+**LedgerService 6 个操作**：
+
+| 方法 | 双账写入 | 用途 |
+|---|---|---|
+| `freeze` | `+frozen / -available`（同账户两列） | 提现冻结、订单挂单 |
+| `unfreeze` | `-frozen / +available` | 提现取消、挂单撤销 |
+| `settle` | `-frozen` + 反向账户 `+available` | 提现广播确认 |
+| `credit` | `+available` + 入金中间 `-` | 充值入账 |
+| `reverseCredit` | `-available` + 入金中间 `+` | reorg 反向冲账 |
+| `transferInternal` | A 账户 `-` + B 账户 `+` | 用户间内部转账 |
+
+**关键决策**：
+
+- **`account` 表只有 `available + frozen` 两列**：不再细分"在途 / 不可用 / 受限"，复杂场景靠 journal 还原。约束越简，bug 越少。
+- **`account_journal` 是 append-only**：永不 UPDATE 也不 DELETE。审计追溯靠 `WHERE biz_type=? AND biz_id=?`。
+- **CAS 更新 `account`**：`UPDATE account SET available=available-?, version=version+1 WHERE id=? AND version=#{old} AND available>=#{amount}`，零行影响 = 余额不足或并发冲突。
+- **直接读 SQL 而非 ORM**：双账法的 SQL 形态必须能被人类一眼看懂，方便 review。MyBatis-Plus 简单 CRUD 用注解，复杂 join 写 XML mapper。
+- **不依赖任何具体链**：wallet.core 只看 chain enum，不引 wallet.chain.btc/eth/tron。
+
+**易踩的坑**：
+
+- 单边记账（只写一条 journal）：审计永远查不出余额对不上的根因。**红线**：每个 LedgerService 操作必写两条 journal，单测必校验 `SUM(journal) GROUP BY trace_id == 0`。
+- 业务侧不传 trace_id 直接重入：第二次 insert 撞 `uk` 抛错——这就是设计意图。业务侧抓异常 = 老调用，无视即可。
+- 跨账户转账没在同一事务：A 扣了 B 没加 → 总额不平。**全部在 `@Transactional` 内**。
+- `SystemAccount` 不存在但被引用：用 `@PostConstruct` 在启动期保证插入这 4 行系统账户。
 
 ### Task 32: 14 张表的 Entity（一次性创建）
 
@@ -3923,6 +4747,40 @@ git commit -m "feat(core): LedgerService interface with 6 ops"
 ```
 
 ### Task 36: LedgerServiceImpl 双账法实现
+
+**设计考虑**：
+
+```mermaid
+flowchart TB
+    Cmd[LedgerCommand<br/>traceId/bizType/bizId/from/to/amount] --> TX["@Transactional 开事务"]
+    TX --> CAS1[UPDATE account from<br/>available -=, version+1<br/>WHERE version=old]
+    CAS1 -- ok --> CAS2[UPDATE account to<br/>available +=, version+1]
+    CAS1 -- 0 row --> Insufficient[余额不足或冲突<br/>抛异常 + 回滚]
+    CAS2 -- ok --> J1[INSERT journal -1<br/>balance_after from]
+    J1 --> J2[INSERT journal +1<br/>balance_after to]
+    J2 --> Commit[commit]
+    J1 -- duplicate uk --> Idem[幂等命中<br/>当前操作已成功执行过，跳过]
+```
+
+**关键决策**：
+
+- **CAS UPDATE 必须带余额条件**：`SET available=available-? WHERE id=? AND version=? AND available>=?`。三段同时校验：
+  1. version 防并发；
+  2. available>=amount 防超扣；
+  3. id 锁定行。
+  零行影响 → 抛 `InsufficientBalanceException`，让业务区分"余额不足"和"并发失败"。
+- **journal `balance_after` 字段**：写入时 `available - amount` 已知，可直接填入。便于 reconcile 时回放——任意时刻 balance = 该账户最后一条 journal 的 balance_after。
+- **`uk(trace_id, direction, account_id)` 唯一约束**：第二次重入会撞 `DuplicateKeyException`，此时 LedgerServiceImpl 把它**当成幂等命中**——业务调用方第一次已经成功执行过，第二次什么也不做即可（不再回滚整个事务）。
+- **`freeze / unfreeze` 用同账户的 available + frozen 列**：不需要跨账户。但 journal 仍写两条（direction +1 改 frozen，direction -1 改 available），凑零不变量在"该账户的两个不同列"上成立。
+- **不在 LedgerServiceImpl 直接调 KafkaTemplate**：账本变更的事件由调用方（business service）通过 `TransactionalEventPublisher` 写 outbox。Ledger 只管账，不管对外通知。
+- **失败时直接抛异常 + Spring 自动回滚**：不要自己手动 try/catch 然后吞掉异常——这会破坏事务边界。
+
+**易踩的坑**：
+
+- CAS 失败重试逻辑放在 LedgerService 内：风险很大，业务期望"扣钱失败立刻知道"，而不是隐式重试 5 次成了。把重试推给业务层。
+- `uk` 唯一约束的 `direction` 字段忘了加：同 trace + 同账户两条 journal 撞 `uk` 失败。**一定要 (trace_id, direction, account_id) 三字段联合唯一**——同 trace 同账户但不同 direction 是合法的（freeze 场景）。
+- 用 `BigDecimal.equals` 比较金额：`new BigDecimal("1.0").equals(new BigDecimal("1.00"))` 是 false（scale 不同）。**用 `compareTo`**。
+- 记 SQL 时把 `amount` 写成 `?`：BigDecimal 必须 setBigDecimal，否则精度丢失。MyBatis 默认正确处理 BigDecimal，但手写 PreparedStatement 时容易踩。
 
 **Files:**
 - Create: `wallet/src/main/java/com/exchange/wallet/core/ledger/LedgerServiceImpl.java`
@@ -4258,6 +5116,39 @@ git commit -m "test(core): LedgerService IT — zero-sum + idempotency + freeze/
 
 ### Task 38: AddressPoolService（地址预生成 + 分配 + 回收）
 
+**设计考虑**：
+
+```mermaid
+flowchart TB
+    Pre[启动 / 定时巡检<br/>检查空闲地址 < 阈值]
+    Pre --> Bat[批量预派生<br/>BIP-32 N 条 m/44'/coin'/0'/0/index]
+    Bat --> Wm[并发安全：<br/>预占 hd_path 表]
+    Wm --> Save[落 wallet_address + key_material]
+
+    User[用户首次充值] --> Allot[allotAddress chain, userId]
+    Allot --> Q[查 wallet_address<br/>WHERE status=FREE]
+    Q --> Lock[CAS UPDATE status=ASSIGNED<br/>WHERE id=? AND status=FREE]
+    Lock -- ok --> Ret[返回地址]
+    Lock -- 0 row --> Retry[重试或扩池]
+
+    Recycle[地址失效/泄漏疑似] --> R[recycleAddress<br/>UPDATE status=DISABLED]
+```
+
+**关键决策**：
+
+- **预生成 + 异步补池**：用户首次充值时不能等"现派生 → 落 KMS → 落 DB"链路完成（IO 串行可能 50-200ms）。预先备好 N 万条空闲地址，allotAddress 就是一次 CAS UPDATE。
+- **CAS 防并发分配**：`UPDATE wallet_address SET status='ASSIGNED', user_id=?, updated_at=now() WHERE id=? AND status='FREE'`。零行影响 = 同地址被并发分走，重试。
+- **`hd_path` 表的作用**：批量派生时先写 hd_path 占位（chain + index），落 wallet_address 后才删除占位 / 标记完成；防止两个 batch 任务派生重叠 index。
+- **不一次派太多**：BIP-32 派生本身快，但 `key_material` 的 KMS encrypt 可能受 KMS QPS 限制。建议每 batch 100-500，定时巡检看池水位低于阈值时再补。
+- **回收策略保守**：默认地址终身归用户所有；只有"私钥泄漏疑似"才标记 `DISABLED`。这样用户的"老充值地址"永远可用，不会让用户惊讶。
+- **`status` 三态**：`FREE / ASSIGNED / DISABLED`，再加扩展 `RESERVED`（运维占位）。
+
+**易踩的坑**：
+
+- 启动时池子空 + 用户立刻请求：把"等池水位达标"加到 readiness probe；K8s 在池就位前不向 service 转流量。
+- 同 chain 多机房：每个机房独立分配可能导致 hd_path index 撞——本期假设单机房；多机房时 hd_path 表加 region 字段。
+- 地址池被攻击者用脚本耗尽：用户每次充值才分配，但攻击者可以伪造大量"用户首次充值请求"耗光预派生池。需要业务侧对 user 有限流（每 user 每 chain 最多 1 个地址）。
+
 **Files:**
 - Create: `wallet/src/main/java/com/exchange/wallet/core/address/AddressPoolService.java`
 
@@ -4370,6 +5261,26 @@ git commit -m "feat(core): AddressPoolService with HD path uniqueness"
 
 ### Task 39: WalletAutoConfiguration 让 wallet 子包被 bootstrap 扫描
 
+**设计考虑**：
+
+与 Task 17 的 `MqAutoConfiguration` 同思路：wallet 模块作为基础库，自带装配，使用方零配置。
+
+```mermaid
+flowchart LR
+    Boot[bootstrap @SpringBootApplication] --> Imp["AutoConfiguration.imports"]
+    Imp --> WAC[WalletAutoConfiguration]
+    WAC --> CS["@ComponentScan<br/>com.exchange.wallet"]
+    WAC --> MS["@MapperScan<br/>chain.api / signer / nonce / fee / core"]
+    CS --> Beans[Signer / NonceAllocator / LedgerService / AddressPool / ...]
+```
+
+**关键决策**：
+
+- **`@ComponentScan(basePackages = "com.exchange.wallet")`**：扫所有 wallet 子包；与 Task 17 不同的是，wallet 子包结构稳定（`chain.api / signer / nonce / fee / core`），可放心一次扫到底。
+- **`@MapperScan` 显式列子包**：mapper 散落在多个子包（`signer.kms`、`nonce`、`core.mapper` 等），显式列出避免扫到非 mapper 接口。
+- **不建议把 wallet 的 Bean 暴露到 bootstrap 全局扫描**：保持"基础库自带装配"原则；bootstrap 只负责启动，不知道也不应该知道 wallet 内部包结构。
+- **不加 `ConditionalOnProperty` 开关**：wallet 是核心模块，开关意义不大；如果将来需要"测试模式跳过 wallet 装配"，再加。
+
 **Files:**
 - Create: `wallet/src/main/java/com/exchange/wallet/WalletAutoConfiguration.java`
 - Create: `wallet/src/main/resources/META-INF/spring/org.springframework.boot.autoconfigure.AutoConfiguration.imports`
@@ -4426,6 +5337,50 @@ git commit -m "feat(wallet): autoconfiguration entry"
 ---
 
 ## Phase 9 — 验收
+
+### 全景：Plan 1 完成判据
+
+Plan 1 是后续 4 个 Plan 的硬前置，验收的核心问题是"基础设施能不能撑起 ETH/BTC/TRON 三条链的端到端"。三个层次：
+
+```mermaid
+flowchart TB
+    subgraph L1[1. 编译 / 测试层]
+        A[mvn clean install]
+        B[全量单测 + 集成测试绿]
+    end
+
+    subgraph L2[2. 启动 / 健康层]
+        C[bootstrap 起得来]
+        D[Flyway V2 已落 19 张表]
+        E[/actuator/health = UP]
+        F[Bean 装配齐全：Ledger/Signer/Nonce/Fee/MQ]
+    end
+
+    subgraph L3[3. 关键不变量层]
+        G[双账法凑零集成测试 PASS]
+        H[outbox PENDING 行被 Relay 消化为 SENT]
+        I[ConsumedRecord 幂等闸阻断重放]
+    end
+
+    L1 --> L2 --> L3
+```
+
+| 层次 | 通过条件 | 失败提示 |
+|---|---|---|
+| 编译 | `mvn clean install` BUILD SUCCESS | 检查父 pom 版本、子模块依赖闭包 |
+| 单测 | wallet / common 全绿 | 单测 fail = 实现细节 bug，逐个修 |
+| 集成测试 | LedgerServiceImplIT + MqIntegrationTest 绿 | 容器启不来 → 检查 docker / 镜像缓存 |
+| 启动 | bootstrap 起来 + actuator/health=UP | 看 boot.log 第一个 WARN/ERROR |
+| 表清单 | mysql 出现 19 张业务表 + flyway_schema_history | Flyway V2 没跑 → 看 schema_history |
+| 双账平衡 | LedgerServiceImplIT 内部检查 SUM=0 | 实现 bug，回 Task 36 修 |
+
+**不在本期验收范围**：
+
+- 链上端到端（充值入账 / 提现广播）→ Plan 2 落
+- 归集 / 冷热 / 对账 → Plan 3 落
+- BTC / TRON 链实现 → Plan 4 / 5 落
+
+通过本 Phase 后即可进入 Plan 2（ETH 端到端），Plan 1 不再回炉。
 
 ### Task 40: 全量编译 + 全量测试 + 启动健康检查
 
