@@ -1,0 +1,22 @@
+spring:
+  datasource:
+    url: ${mysql.url}?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=Asia/Shanghai
+    username: test
+    password: test
+    driver-class-name: com.mysql.cj.jdbc.Driver
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+    baseline-on-migrate: true
+  autoconfigure:
+    exclude:
+      - org.springframework.boot.autoconfigure.kafka.KafkaAutoConfiguration
+      - org.redisson.spring.starter.RedissonAutoConfigurationV2
+      - org.springframework.boot.autoconfigure.data.redis.RedisAutoConfiguration
+      - org.springframework.boot.autoconfigure.data.redis.RedisRepositoriesAutoConfiguration
+mybatis-plus:
+  configuration:
+    map-underscore-to-camel-case: true
+exchange:
+  mq:
+    enabled: false
