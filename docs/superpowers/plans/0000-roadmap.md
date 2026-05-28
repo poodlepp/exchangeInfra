@@ -2,7 +2,7 @@
 
 > 本路线图把 `2026-05-26-cex-wallet-design.md` 拆成 5 个独立可交付的 Plan，每个 Plan 完成后系统都处于"能跑、能测、能演示"的状态。详细任务步骤拆分位于 `docs/superpowers/plans/` 下各自的 plan 文档。
 
-## Plan 1 — Foundation（基础设施）
+## Plan 1 — Foundation（基础设施） ✅ DONE (2026-05-28)
 
 **交付件路径**：`docs/superpowers/plans/2026-05-26-plan1-foundation.md`
 
