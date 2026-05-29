@@ -27,7 +27,7 @@
 
 ## Plan 2 — ETH 端到端
 
-**交付件路径**：`docs/superpowers/plans/<date>-plan2-eth-e2e.md`（在 Plan 1 收尾时再写）
+**交付件路径**：`docs/superpowers/plans/2026-05-29-plan2-eth-e2e.md`
 
 **职责范围**：
 - `wallet.chain.eth`：MultiRpcChainClient（多 RPC 高可用 + circuit breaker）、TxBuilder（EIP-1559）、TxBroadcaster、TxParser（含 ERC20 Log 解析、特殊交易过滤）、AddressDerivator、FeeStrategy ETH 实现
